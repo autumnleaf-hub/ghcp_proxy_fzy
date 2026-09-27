@@ -5,17 +5,27 @@
 Use the repo-local virtualenv for all Python tests and tooling:
 
 ```sh
-./.venv/bin/pytest ...
+./.venv/bin/python -m unittest tests.test_excel_upstream -v
 ```
 
-Do not use bare `pytest` or `python3 -m pytest` unless you have first verified
+On Windows, use `./.venv/Scripts/python.exe` instead.
+
+Do not use a system Python or bare `pytest` unless you have first verified
 they resolve inside `./.venv`. The system Python on this machine may not have
-project dependencies such as `pytest`, `httpx`, or `fastapi` installed.
+project dependencies such as `httpx` or `fastapi` installed.
 
 ## Tests
 
-The top-level pytest suite has been removed. Use syntax checks or targeted
-manual verification for changes.
+The unittest suite lives in the `tests/` package. Run commands from the
+repository root; use package-qualified names such as `tests.test_excel_upstream`
+for targeted checks. Discover the full suite with:
+
+```sh
+./.venv/bin/python -m unittest discover -s tests -t . -v
+```
+
+See `tests/README.md` for platform-specific commands. Keep production modules
+in the repository root and resolve production fixtures relative to that root.
 
 The `mutants/` directory is a generated mutation-testing workspace that mirrors
 the source tree. Do not include it in normal searches or manual edits unless

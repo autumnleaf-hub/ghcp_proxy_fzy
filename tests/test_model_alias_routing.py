@@ -1,6 +1,6 @@
 """Offline routing-service regression tests; never use the user's configuration.
 
-Run with ./.venv/Scripts/python.exe -B -m unittest -v test_model_alias_routing
+Run with ./.venv/Scripts/python.exe -B -m unittest -v tests.test_model_alias_routing
 (or ./.venv/bin/python on POSIX). No proxy/server imports or network requests.
 """
 

@@ -5,7 +5,7 @@ import unittest
 
 import excel_upstream as upstream
 import format_translation as ft
-from test_codex_tool_compat import source_tools, transport
+from tests.test_codex_tool_compat import source_tools, transport
 
 
 class CodexTransportRecoveryTests(unittest.TestCase):

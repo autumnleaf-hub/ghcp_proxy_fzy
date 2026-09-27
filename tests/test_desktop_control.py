@@ -1,6 +1,6 @@
 """Offline ASGI tests: no listener, real PID, process control, or user settings.
 
-Run with ./.venv/Scripts/python.exe -B -m unittest -v test_desktop_control
+Run with ./.venv/Scripts/python.exe -B -m unittest -v tests.test_desktop_control
 """
 from __future__ import annotations
 

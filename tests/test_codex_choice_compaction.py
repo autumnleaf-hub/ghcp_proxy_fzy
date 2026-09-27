@@ -1,6 +1,6 @@
 import copy,json,unittest
-from test_codex_bridge_regressions import OfflineBase, native_call, LOCAL_TOOLS
-from test_client_tool_recovery import completed,message
+from tests.test_codex_bridge_regressions import OfflineBase, native_call, LOCAL_TOOLS
+from tests.test_client_tool_recovery import completed,message
 
 class ChoiceAndCompactionTests(OfflineBase):
     def setUp(self):

@@ -1,7 +1,7 @@
 """Offline settings/runtime tests using AST-extracted production route bodies.
 
 No proxy import/startup, sockets, git, real settings, registry, or process control.
-Run: ./.venv/Scripts/python.exe -B -m unittest -v test_auto_update_toggle
+Run: ./.venv/Scripts/python.exe -B -m unittest -v tests.test_auto_update_toggle
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ with ExitStack() as _imports:
         _imports.enter_context(mock.patch(_target, side_effect=AssertionError('offline import')))
     import auto_update
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 PORT = 49178  # In-memory ASGI metadata only; no listener is created.
 ROUTE = '/api/config/auto-update'
 

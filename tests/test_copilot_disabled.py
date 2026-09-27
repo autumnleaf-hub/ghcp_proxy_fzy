@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 from fastapi.responses import JSONResponse
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 def definitions(filename, names, **scope):
     tree = ast.parse((ROOT / filename).read_text(encoding="utf-8-sig"))

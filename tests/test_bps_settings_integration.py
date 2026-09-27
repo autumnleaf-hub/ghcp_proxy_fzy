@@ -3,7 +3,7 @@
 No proxy import/lifespan, sockets, subprocesses, real credentials, or worker
 threads. HTTP uses ASGITransport; credential state is memory-only, and settings
 use temporary files. Only external I/O/planning/telemetry boundaries are mocked.
-Run with the repo virtualenv: python -B -m unittest -v test_bps_settings_integration
+Run with the repo virtualenv: python -B -m unittest -v tests.test_bps_settings_integration
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ import protocol_replies
 import upstream_errors
 import util
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 NOW = 2_000_000_000.0
 EXPIRY = 4_102_444_800.0
 MODEL = 'gpt-6-sol-excel'

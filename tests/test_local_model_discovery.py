@@ -24,7 +24,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse, Response
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _stub_module(name):

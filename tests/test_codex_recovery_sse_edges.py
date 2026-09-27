@@ -1,7 +1,7 @@
 import copy,json,unittest
 from unittest import mock
-from test_codex_bridge_regressions import OfflineStreamBase,native_call,stream_events,LOCAL_TOOLS,run_immediate
-from test_client_tool_recovery import completed,message
+from tests.test_codex_bridge_regressions import OfflineStreamBase,native_call,stream_events,LOCAL_TOOLS,run_immediate
+from tests.test_client_tool_recovery import completed,message
 
 class RecoverySSEEdgeTests(OfflineStreamBase):
     def setUp(self):

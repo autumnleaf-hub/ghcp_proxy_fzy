@@ -3,7 +3,7 @@ from unittest import mock
 import client_tool_batch as batch
 import excel_upstream as bridge
 import client_tool_recovery as recovery
-from test_codex_bridge_regressions import OfflineBase,OfflineStreamBase,LOCAL_TOOLS,native_call,stream_events,run_immediate
+from tests.test_codex_bridge_regressions import OfflineBase,OfflineStreamBase,LOCAL_TOOLS,native_call,stream_events,run_immediate
 
 def parent(entries=None,call_id='call_batch_test',version=1):
     if entries is None: entries=[{'name':'exec_command','arguments':{'cmd':'echo first'}},{'name':'exec_command','arguments':{'cmd':'echo second'}}]

@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 
 # Keep incidental Python/runtime output inside the expressly allowed directory.
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = ROOT / '.tmp' / 'codex_bridge_regressions'
 SCRATCH.mkdir(parents=True, exist_ok=True)
 RUNTIME_ENV = {key: str(SCRATCH / key.lower()) for key in

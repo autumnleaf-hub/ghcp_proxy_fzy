@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 
-DASHBOARD = Path(__file__).with_name('dashboard.html')
+DASHBOARD = Path(__file__).resolve().parents[1] / 'dashboard.html'
 
 
 class TemplateParser(HTMLParser):

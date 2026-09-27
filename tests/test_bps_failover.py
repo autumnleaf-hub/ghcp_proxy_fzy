@@ -292,7 +292,7 @@ class EdgeCaseTests(unittest.TestCase):
     def test_only_stdlib_dependencies_and_no_file_import_side_effects(self):
         import ast
         from pathlib import Path
-        tree = ast.parse(Path(__file__).with_name('bps_failover.py').read_text(encoding='utf-8'))
+        tree = ast.parse((Path(__file__).resolve().parents[1] / 'bps_failover.py').read_text(encoding='utf-8'))
         imports = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

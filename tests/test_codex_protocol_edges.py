@@ -2,7 +2,7 @@ import copy
 import json
 from unittest import mock
 import unittest
-from test_codex_bridge_regressions import OfflineStreamBase, native_call, stream_events, run_immediate, LOCAL_TOOLS
+from tests.test_codex_bridge_regressions import OfflineStreamBase, native_call, stream_events, run_immediate, LOCAL_TOOLS
 
 
 class ProtocolEdges(OfflineStreamBase):

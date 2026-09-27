@@ -1,6 +1,6 @@
 import copy, json, unittest
 from unittest import mock
-from test_codex_bridge_regressions import OfflineBase, native_call, LOCAL_TOOLS
+from tests.test_codex_bridge_regressions import OfflineBase, native_call, LOCAL_TOOLS
 import client_tool_recovery as recovery
 import excel_upstream as bridge
 

@@ -1,5 +1,5 @@
 import unittest
-from test_codex_bridge_regressions import OfflineBase
+from tests.test_codex_bridge_regressions import OfflineBase
 import excel_upstream as b
 
 class NativeParallelControlTests(OfflineBase):

@@ -2,8 +2,8 @@ import asyncio, json, unittest
 from contextlib import ExitStack
 from unittest import mock
 import httpx
-from test_codex_bridge_regressions import OfflineStreamBase, native_call, LOCAL_TOOLS, stream_events, run_immediate
-from test_client_tool_recovery import completed, message
+from tests.test_codex_bridge_regressions import OfflineStreamBase, native_call, LOCAL_TOOLS, stream_events, run_immediate
+from tests.test_client_tool_recovery import completed, message
 
 class RecoveryIntegrationTests(OfflineStreamBase):
     def setUp(self):

@@ -1,6 +1,6 @@
 """Offline managed built-in routing tests; all configuration lives in temp dirs.
 
-Run: ./.venv/Scripts/python.exe -B -m unittest -v test_managed_builtin_routes
+Run: ./.venv/Scripts/python.exe -B -m unittest -v tests.test_managed_builtin_routes
 """
 
 import json
@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_model_alias_routing as existing
+import tests.test_model_alias_routing as existing
 
 routing = existing.routing
 ASTRA = existing.ASTRA

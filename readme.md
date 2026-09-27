@@ -360,7 +360,7 @@ The names above and their `-excel` aliases use the Excel backend and require a v
 - 传输解析只接受单个 JSON 工具对象（兼容明确 JSON 围栏和有限的旧嵌套封装），不执行脚本、不猜测缺失工具名、不从任意代码中抽取调用。 对 JSON 字符串中的裸换行、回车、制表符做保值转义；反斜杠紧接真实控制字符时按控制字符转义处理，保留前面成对的反斜杠，避免凭空多出参数字符。已合法 JSON 优先直接解析，不对合法字面量再次反转义；不猜修缺失引号、逗号或拼接对象，其他非法控制字符仍拒绝。旧文本 marker 也经过相同的目录和参数校验，不能绕过无效原生批次的拒绝。
 - 整批通过校验后才写入工具回放缓存；无效批次不会污染后续上下文。拒绝轮次的孤立加密 reasoning 不再回放，之前成功工具轮次的 reasoning 保留。流末尾缺失最终工具列表时不会透传待决的原生工具事件；真实的上游失败、未完成和截断仍明确保留为失败/未完成。
 - 拒绝日志包含 `request_id`、工具名、请求的命名空间、失败分类、固定字段的结构摘要及当轮有效工具目录（名称、数量、指纹，不含 schema 或参数值）。`malformed_transport` 还记录具体解析阶段。客户端拒绝提示也附请求 ID，便于关联日志。启用现有请求追踪时，`request-trace.jsonl` 额外记录 `client_tool_rejected` 事件（`dispatched: false`），可通过请求 ID 关联原始请求；不会为此开启完整 prompt/body 调试记录。
-- 定向离线回归（Windows）：`.venv/Scripts/python.exe -X utf8 -B -m unittest test_codex_tool_schema test_codex_tool_schema_integration test_client_tool_transport test_codex_bridge_regressions test_codex_transport_recovery test_codex_tool_compat test_excel_images test_excel_upstream -q`。桥接边界测试使用假上游并阻断网络；测试不启动或重启代理监听服务。
+- 定向离线回归（Windows）：`.venv/Scripts/python.exe -X utf8 -B -m unittest tests.test_codex_tool_schema tests.test_codex_tool_schema_integration tests.test_client_tool_transport tests.test_codex_bridge_regressions tests.test_codex_transport_recovery tests.test_codex_tool_compat tests.test_excel_images tests.test_excel_upstream -q`。桥接边界测试使用假上游并阻断网络；测试不启动或重启代理监听服务。
 
 ### 工具选择与压缩回放
 

@@ -279,7 +279,7 @@ Reproduce with the repository virtualenv (Windows):
 ```powershell
 .\.venv\Scripts\python.exe tools\analyze-prompt-cache-trace.py "$HOME\Downloads\request-trace.jsonl.zip"
 .\.venv\Scripts\python.exe tools\verify-sdk-cache-continuity.py --output .cache\cache-investigation\replay
-.\.venv\Scripts\python.exe -m unittest test_copilot_sdk_upstream test_excel_upstream test_reasoning_translation test_responses_replay_ids test_request_prompt_archive -q
+.\.venv\Scripts\python.exe -m unittest tests.test_copilot_sdk_upstream tests.test_excel_upstream tests.test_reasoning_translation tests.test_responses_replay_ids tests.test_request_prompt_archive -q
 ```
 
 **Remaining limits**
