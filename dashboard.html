@@ -1796,7 +1796,7 @@
     .credential-toolbar { margin: 12px 0 8px; flex-wrap: wrap; }
     .credential-list { display: grid; gap: 10px; margin-top: 14px; }
     .credential-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) minmax(220px, auto); gap: 14px; align-items: start; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); }
-    .credential-identity, .credential-details, .credential-actions, .credential-label, .outbound-proxy-url { display: grid; gap: 6px; min-width: 0; }
+    .credential-identity, .credential-details, .credential-actions, .credential-label, .outbound-proxy-url, .concurrency-field { display: grid; gap: 6px; min-width: 0; }
     .credential-enabled { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
     .credential-enabled .switch-track input, .outbound-proxy-card .switch-track input { display: block; position: absolute; inset: 0; width: 100%; height: 100%; min-width: 0; margin: 0; padding: 0; opacity: 0; cursor: pointer; z-index: 1; }
     .credential-enabled .switch-track:focus-within, .outbound-proxy-card .switch-track:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; }
@@ -2882,6 +2882,18 @@
 
       <div v-show="activeView === 'settings'" class="legacy-section">
         <div class="settings-stack">
+          <article class="mini-card" :aria-busy="requestConcurrency.loading || requestConcurrency.saving">
+            <div class="eyebrow">请求控制</div><h3>并发限制与等待队列</h3>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;">
+              <label class="concurrency-field"><span class="detail-label">并发上限（0 = 无限制）</span><input type="number" min="0" step="1" v-model="requestConcurrency.limit" :disabled="requestConcurrency.loading || requestConcurrency.saving || !requestConcurrency.loaded" @keydown.enter.prevent="saveRequestConcurrency"></label>
+              <label class="concurrency-field"><span class="detail-label">队列容量（默认 10）</span><input type="number" min="0" step="1" v-model="requestConcurrency.queue_size" :disabled="requestConcurrency.loading || requestConcurrency.saving || !requestConcurrency.loaded" @keydown.enter.prevent="saveRequestConcurrency"></label>
+            </div>
+            <div class="subtle" style="margin-top:8px;">默认并发上限为 0，不限制并发、不排队。启用限制后，超出的请求按先到先处理排队；队列满时直接返回 HTTP 429，不转发到上游。队列容量为 0 表示不排队。</div>
+            <div class="subtle">覆盖推理、压缩和 BPS 验证请求；流式请求直到结束或取消才释放名额。降低上限不会中断已运行或已排队的请求。配置会持久保存。</div>
+            <div v-if="requestConcurrency.loaded" class="subtle" style="margin-top:8px;">上次刷新：运行中 {{ requestConcurrency.active }}，排队中 {{ requestConcurrency.queued }}。</div>
+            <div class="toolbar"><button @click="loadRequestConcurrency(true)" :disabled="requestConcurrency.loading || requestConcurrency.saving">{{ requestConcurrency.loading ? '正在加载…' : '刷新并发状态' }}</button><div class="spacer"></div><button class="primary" @click="saveRequestConcurrency" :disabled="requestConcurrency.loading || requestConcurrency.saving || !requestConcurrency.loaded">{{ requestConcurrency.saving ? '正在保存…' : '保存并发设置' }}</button></div>
+            <div v-if="requestConcurrency.error" class="status error" role="alert">{{ requestConcurrency.error }}</div><div v-else-if="requestConcurrency.statusMessage" class="status good" role="status">{{ requestConcurrency.statusMessage }}</div>
+          </article>
           <article class="mini-card outbound-proxy-card" :aria-busy="outboundProxy.loading || outboundProxy.saving">
             <div class="eyebrow">网络设置</div><h3>出站代理</h3>
             <div class="routing-toggle"><span>为 BPS 请求、文件上传和 OAuth 启用代理</span><label :class="['switch-track', outboundProxy.enabled ? 'on' : '']"><input type="checkbox" v-model="outboundProxy.enabled" :disabled="outboundProxy.loading || outboundProxy.saving || !outboundProxy.loaded" aria-label="启用出站代理"><span class="switch-knob"></span></label></div>
@@ -4244,6 +4256,10 @@
             loading: false, busy: false, requestId: 0, error: '', statusMessage: '',
             loginActive: false, cancellingLogin: false, loginPollErrors: 0,
             loginError: '', loginMessage: '',
+          },
+          requestConcurrency: {
+            limit: 0, queue_size: 10, active: 0, queued: 0, loaded: false,
+            loading: false, saving: false, error: '', statusMessage: '',
           },
           outboundProxy: {
             enabled: false, url: 'http://127.0.0.1:7890', loaded: false,
@@ -5664,7 +5680,7 @@
           if (action === 'test') account.probeResult = null;
           try {
             const url = '/api/credentials/' + encodeURIComponent(account.id) + (action === 'test' ? '/test' : '');
-            const options = action === 'delete' ? { method: 'DELETE' } : {
+            const options = action === 'delete' ? { method: 'DELETE', headers: { 'Content-Type': 'application/json' } } : {
               method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
             };
             if (patch) {
@@ -5739,6 +5755,48 @@
             this.credentialManager.loginMessage = this.credentialManager.loginError ? '' : succeeded ? '登录完成，请逐个验证 BPS 权限。' : '登录流程已结束。';
           }
           await this.loadCredentials();
+        },
+        applyRequestConcurrencyPayload(payload) {
+          if (!payload || !['limit', 'queue_size', 'active', 'queued'].every((key) => Number.isSafeInteger(payload[key]) && payload[key] >= 0)) throw new Error('并发设置响应格式无效。');
+          for (const key of ['limit', 'queue_size', 'active', 'queued']) this.requestConcurrency[key] = payload[key];
+          this.requestConcurrency.loaded = true;
+        },
+        async loadRequestConcurrency(force = false) {
+          const config = this.requestConcurrency;
+          if (config.loading || config.saving || (config.loaded && !force)) return;
+          config.loading = true; config.error = ''; config.statusMessage = '';
+          try {
+            this.applyRequestConcurrencyPayload(await this.dashboardJsonRequest('/api/config/concurrency', { cache: 'no-store' }));
+          } catch (error) {
+            config.error = '加载并发设置失败（首次更新后请重启代理）：' + error.message;
+          } finally {
+            config.loading = false;
+          }
+        },
+        async saveRequestConcurrency() {
+          const config = this.requestConcurrency;
+          if (!config.loaded || config.loading || config.saving) return;
+          config.error = ''; config.statusMessage = '';
+          const limit = Number(config.limit);
+          const queue_size = Number(config.queue_size);
+          if ([config.limit, config.queue_size].some((value) => String(value).trim() === '') ||
+              !Number.isSafeInteger(limit) || limit < 0 || !Number.isSafeInteger(queue_size) || queue_size < 0) {
+            config.error = '并发上限和队列容量必须为非负整数。';
+            return;
+          }
+          config.saving = true;
+          try {
+            const payload = await this.dashboardJsonRequest('/api/config/concurrency', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ limit, queue_size }),
+            });
+            this.applyRequestConcurrencyPayload(payload);
+            config.statusMessage = '并发设置已保存并立即生效。';
+          } catch (error) {
+            config.error = '保存并发设置失败：' + error.message;
+          } finally {
+            config.saving = false;
+          }
         },
         applyOutboundProxyPayload(payload) {
           if (typeof payload.enabled !== 'boolean' || typeof payload.url !== 'string') throw new Error('出站代理配置格式无效。');
@@ -6864,6 +6922,7 @@
             this.loadClientProxyStatus();
             this.loadExcelSessionStatus();
             this.loadOutboundProxy();
+            this.loadRequestConcurrency();
           } else if (view === 'integrations') {
             this.loadCredentials();
             this.loadExcelSessionStatus();

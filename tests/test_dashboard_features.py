@@ -129,6 +129,9 @@ async function check(name, run) {
       assert.equal(request.headers?.['Content-Type'], 'application/json', request.url + ': Content-Type');
       assert.equal(typeof request.body, 'string', request.url + ': serialized JSON body');
       assert.ok(JSON.parse(request.body), request.url + ': JSON payload');
+    } else if (request.method === 'DELETE') {
+      assert.equal(request.headers?.['Content-Type'], 'application/json', request.url + ': Content-Type');
+      assert.equal(request.body, undefined, request.url + ': bodyless deletion');
     }
   }
   assert.equal(queue.length, 0, name + ': unused mocks'); count++; console.log('PASS ' + name);
@@ -199,11 +202,73 @@ async function check(name, run) {
     await s.testCredential(a); assert.match(a.actionError, /缺少有效凭证/);
     assert.equal(s.dashboardErrorMessage({ error: { message: '嵌套错误' } }), '嵌套错误');
   });
-  await check('deletion confirms and handles empty 204', async () => {
-    const s = state(); const a = await loadAccount(s); const before = requests.length; confirmDelete = false;
-    await s.deleteCredential(a); assert.equal(requests.length, before); confirmDelete = true;
-    response('/api/credentials/acct%20%2Fone', null, { method: 'DELETE', status: 204 }); response('/api/credentials', list([]));
-    await s.deleteCredential(a); assert.equal(s.credentialManager.credentials.length, 0);
+  for (const status of [200, 204]) {
+    await check('deletion confirms and handles status ' + status, async () => {
+      const s = state(); const a = await loadAccount(s, credential({ enabled: false, status: 'disabled' }));
+      const before = requests.length; confirmDelete = false;
+      await s.deleteCredential(a); assert.equal(requests.length, before); confirmDelete = true;
+      response('/api/credentials/acct%20%2Fone', status === 204 ? null : list([]), { method: 'DELETE', status });
+      response('/api/credentials', list([]));
+      await s.deleteCredential(a);
+      assert.equal(s.credentialManager.credentials.length, 0);
+      assert.equal(a.actionError, ''); assert.equal(a.pending, ''); assert.equal(s.credentialManager.busy, false);
+    });
+  }
+  await check('failed deletion preserves credentials and releases busy state', async () => {
+    const s = state(); const a = await loadAccount(s);
+    response('/api/credentials/acct%20%2Fone', { detail: 'Use application/json.' }, { method: 'DELETE', status: 415 });
+    await s.deleteCredential(a);
+    assert.equal(s.credentialManager.credentials.length, 1);
+    assert.equal(s.credentialManager.credentials[0], a);
+    assert.equal(a.actionError, '操作失败：Use application/json.');
+    assert.equal(a.pending, ''); assert.equal(s.credentialManager.busy, false);
+  });
+  await check('finite concurrency settings load and refresh queue status', async () => {
+    const s = state();
+    response('/api/config/concurrency', { limit: 3, queue_size: 10, active: 3, queued: 2 });
+    await s.loadRequestConcurrency();
+    assert.equal(s.requestConcurrency.loaded, true); assert.equal(s.requestConcurrency.limit, 3);
+    assert.equal(s.requestConcurrency.queue_size, 10); assert.equal(s.requestConcurrency.queued, 2);
+    const before = requests.length; await s.loadRequestConcurrency(); assert.equal(requests.length, before);
+    response('/api/config/concurrency', { limit: 3, queue_size: 10, active: 2, queued: 0 });
+    await s.loadRequestConcurrency(true); assert.equal(s.requestConcurrency.active, 2);
+  });
+  await check('finite concurrency save sends exact JSON fields', async () => {
+    const s = state(); s.applyRequestConcurrencyPayload({ limit: 3, queue_size: 10, active: 3, queued: 2 });
+    s.requestConcurrency.limit = '2'; s.requestConcurrency.queue_size = '4';
+    response('/api/config/concurrency', { limit: 2, queue_size: 4, active: 3, queued: 2 },
+      { method: 'POST', body: { limit: 2, queue_size: 4 } });
+    await s.saveRequestConcurrency();
+    assert.equal(s.requestConcurrency.limit, 2); assert.equal(s.requestConcurrency.queue_size, 4);
+    assert.equal(s.requestConcurrency.saving, false); assert.match(s.requestConcurrency.statusMessage, /立即生效/);
+  });
+  await check('invalid concurrency inputs never submit', async () => {
+    const s = state();
+    for (const field of ['limit', 'queue_size']) {
+      for (const value of [-1, '', ' ', 1.5, 'invalid']) {
+        s.applyRequestConcurrencyPayload({ limit: 3, queue_size: 10, active: 0, queued: 0 });
+        s.requestConcurrency[field] = value; const before = requests.length;
+        await s.saveRequestConcurrency(); assert.equal(requests.length, before);
+        assert.match(s.requestConcurrency.error, /非负整数/);
+      }
+    }
+  });
+  await check('concurrency save errors preserve drafts and reject missing acknowledgments', async () => {
+    const s = state(); s.applyRequestConcurrencyPayload({ limit: 3, queue_size: 10, active: 3, queued: 2 });
+    s.requestConcurrency.limit = 2; s.requestConcurrency.queue_size = 4;
+    response('/api/config/concurrency', { detail: 'fixture storage failure' }, { status: 500, method: 'POST' });
+    await s.saveRequestConcurrency(); assert.match(s.requestConcurrency.error, /fixture storage failure/);
+    assert.equal(s.requestConcurrency.limit, 2); assert.equal(s.requestConcurrency.queue_size, 4);
+    assert.equal(s.requestConcurrency.saving, false);
+    response('/api/config/concurrency', {}, { method: 'POST' });
+    await s.saveRequestConcurrency(); assert.match(s.requestConcurrency.error, /响应格式无效/);
+    assert.equal(s.requestConcurrency.statusMessage, '');
+  });
+  await check('failed concurrency load cannot overwrite existing configuration', async () => {
+    const s = state(); response('/api/config/concurrency', { detail: 'Not Found' }, { status: 404 });
+    await s.loadRequestConcurrency(); assert.equal(s.requestConcurrency.loaded, false);
+    assert.match(s.requestConcurrency.error, /重启代理/);
+    const before = requests.length; await s.saveRequestConcurrency(); assert.equal(requests.length, before);
   });
   await check('list errors retain the previously loaded rows', async () => {
     const s = state(); await loadAccount(s); response('/api/credentials', { detail: { message: '暂时无法读取' } }, { status: 503 });
@@ -408,10 +473,22 @@ class DashboardFeatureTests(unittest.TestCase):
                         self.assertNotIn('Offline scenarios passed:', result.stdout)
 
     @unittest.skipUnless(shutil.which('node'), 'Node.js is required for JavaScript checks')
+    def test_delete_json_header_regression_is_rejected(self):
+        contract = "method: 'DELETE', headers: { 'Content-Type': 'application/json' }"
+        self.assertIn(contract, self.html)
+        with tempfile.TemporaryDirectory(prefix='dashboard-delete-contract-') as directory:
+            fixture = Path(directory) / 'dashboard.html'
+            fixture.write_text(self.html.replace(contract, "method: 'DELETE'", 1), encoding='utf-8')
+            result = subprocess.run([shutil.which('node'), '-', str(fixture)], input=OFFLINE_JS, text=True, capture_output=True, encoding='utf-8', timeout=30)
+            self.assertNotEqual(result.returncode, 0, 'Missing DELETE JSON header escaped regression checks')
+            self.assertIn('Content-Type', result.stderr)
+            self.assertNotIn('Offline scenarios passed:', result.stdout)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required for JavaScript checks')
     def test_javascript_and_mocked_api_behaviour(self):
         result = subprocess.run([shutil.which('node'), '-', str(DASHBOARD)], input=OFFLINE_JS, text=True, capture_output=True, encoding='utf-8', timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('Offline scenarios passed: 34', result.stdout)
+        self.assertIn('Offline scenarios passed: 41', result.stdout)
         print(result.stdout.strip())
 
 

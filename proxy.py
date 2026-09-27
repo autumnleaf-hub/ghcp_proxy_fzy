@@ -153,6 +153,7 @@ from rate_limiting import (
     throttled_client_post,
     throttled_client_send,
 )
+from request_concurrency import RequestConcurrencyMiddleware, RequestConcurrencyService
 
 
 # ─── App & Global State ──────────────────────────────────────────────────────
@@ -172,6 +173,8 @@ def _desktop_shutdown_callback():
 
 
 app = FastAPI()
+request_concurrency_service = RequestConcurrencyService()
+app.add_middleware(RequestConcurrencyMiddleware, limiter=request_concurrency_service.limiter)
 _attachment_store = AttachmentStore()
 app.include_router(create_attachment_router(_attachment_store, PROXY_PORT))
 desktop_service_controller = desktop_control.DesktopServiceController(
@@ -5713,6 +5716,25 @@ def _require_local_bps_management(request: Request, *, write: bool = False):
         raise HTTPException(status_code=403, detail='禁止跨站管理请求。')
     if write and request.headers.get('content-type', '').split(';', 1)[0].strip().lower() != 'application/json':
         raise HTTPException(status_code=415, detail='Use application/json.')
+
+
+@app.get('/api/config/concurrency')
+async def request_concurrency_status_api(request: Request):
+    _require_local_bps_management(request)
+    return JSONResponse(request_concurrency_service.status(), headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/config/concurrency')
+async def request_concurrency_config_api(request: Request):
+    _require_local_bps_management(request, write=True)
+    payload = await parse_json_request(request)
+    try:
+        result = await request_concurrency_service.update(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail='无法保存并发设置，当前设置未更改。') from exc
+    return JSONResponse(result, headers={'Cache-Control': 'no-store'})
 
 
 @app.get('/api/config/outbound-proxy')

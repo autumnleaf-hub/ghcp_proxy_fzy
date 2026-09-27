@@ -261,6 +261,27 @@ Set environment variables before starting the proxy.
 
 Standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables are also honored.
 
+### Request Concurrency and Queue
+
+The dashboard **Settings** page includes a global concurrency limit and a
+bounded FIFO queue. The concurrency limit defaults to **0** (unlimited); the
+waiting queue defaults to **10** requests. With a finite limit, requests wait
+until a slot is released. Requests arriving when the queue is full receive
+HTTP **429** with `concurrency_queue_full` and are not sent upstream. A queue
+capacity of **0** disables waiting.
+
+The limit covers Responses, Responses Compact, Chat Completions, Messages and
+BPS verification requests. Streaming requests hold their slot until completion
+or cancellation. Disconnected queued requests are removed. Management and
+status endpoints remain available even when all slots and queue entries are used.
+Lowering limits does not cancel requests that are already active or queued.
+
+Settings are saved atomically in `request-concurrency.json` in the user config
+directory and apply immediately after a successful save. Restart the proxy once
+after installing this feature to load the new backend; later settings changes
+do not require restarting. Regression tests use small finite limits, primarily
+**3**, isolated configuration files and fake requests, not unrestricted traffic.
+
 ### Enterprise Proxy Example
 
 ```bash
