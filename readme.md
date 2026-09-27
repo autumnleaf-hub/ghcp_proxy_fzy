@@ -1,412 +1,490 @@
-# GHCP Proxy
+# BPS 代理（ghcp_proxy_fzy）
 
-GHCP Proxy provides an OpenAI-compatible local endpoint for using GitHub Copilot with Codex and the ChatGPT app. Claude Code is also supported through a compatibility integration.
+一个运行在本机的 **ChatGPT / BPS 代理**，主要用于将 Codex 的 Responses 请求转发到已登录账号可访问的 BPS 后端，并提供中文网页控制台、多凭证管理、模型路由和 Windows 托盘管理器。
 
-For organizations that provide the official ChatGPT Excel add-in but do not enable ChatGPT for Work or direct Codex access, GHCP Proxy can alternatively route Codex through the backend available to the authenticated Excel add-in session.
+> **先看这里：当前分支仅启用 BPS 上游。** 虽然仓库保留了 GHCP Proxy 的命名和部分历史兼容代码，但 GitHub Copilot 登录、凭证读取和 SDK 已禁用，不会在 BPS 失败时回退到 Copilot。原 Chat Completions / Anthropic Messages 入口返回 `501`，不能将本项目当作完整的 OpenAI 或 Anthropic API 替代品。
+>
+> BPS 兼容功能仍具有实验性质。登录成功不代表账号拥有 BPS 或某个模型的访问权限；本项目不会创建订阅权益，也不保证避免上游风控、403 或账号限制。请只使用自己有权使用的账号和服务，并遵守服务提供方及所在组织的规定。
 
-The dashboard handles authentication, integrations, usage, cost estimates, and optional startup management.
+## 目录
 
-## Supported Backends
+- [功能与兼容范围](#功能与兼容范围)
+- [安装](#安装)
+- [首次登录与验证](#首次登录与验证)
+- [连接 Codex](#连接-codex)
+- [日常启动与停止](#日常启动与停止)
+- [控制台与设置](#控制台与设置)
+- [升级](#升级)
+- [数据保存与备份](#数据保存与备份)
+- [接口与高级配置](#接口与高级配置)
+- [常见问题](#常见问题)
+- [开发与测试](#开发与测试)
 
-| Client                | Backend                        | Use                                                              |
-| --------------------- | ------------------------------ | ---------------------------------------------------------------- |
-| Codex and ChatGPT app | GitHub Copilot                 | Default                                                          |
-| Codex                 | ChatGPT Excel backend          | Alternative when organizational access is provided through Excel |
-| Claude Code           | GHCP Proxy compatibility route | Optional                                                         |
+## 功能与兼容范围
 
-GHCP Proxy listens on loopback only.
+- **Responses 代理**：支持模型发现、Responses 请求和兼容压缩接口，保留流式输出、客户端工具调用与工具结果回放。
+- **登录凭证**：支持独立 ChatGPT OAuth 登录，或读取已有的 Excel 插件会话；可添加、验证、启停、重命名和删除凭证。
+- **多账号调度**：最多管理 32 个凭证；新会话轮询可用凭证，同一会话优先复用原凭证，在安全条件下进行故障切换。
+- **模型路由**：管理内置别名与自定义映射，将客户端请求名称映射到本地注册的 BPS 模型。
+- **并发与排队**：按代理进程限制同时处理的推理请求，超限先进先出排队，队列满时直接拒绝新请求。
+- **中文控制台**：查看请求、会话、用量、模型路由、审批路由和设置；费用展示是本地估算，不是服务商账单。
+- **图片和附件**：支持图片输入、客户端本地文件工具，以及本地文件上传接口；具体文件处理仍受格式、依赖和上游能力限制。
+- **Windows 桌面管理器**：通过 `BPS-Manager.exe` 启停代理、打开控制台和设置当前用户登录时自启动。
 
-```text
-API:       http://127.0.0.1:8001/v1
-Dashboard: http://127.0.0.1:8001/
+默认地址如下，服务仅监听本机回环地址：
+
+| 用途 | 地址 |
+| --- | --- |
+| 网页控制台 | `http://127.0.0.1:8001/ui`，根路径 `/` 也可访问 |
+| API 基础地址 | `http://127.0.0.1:8001/v1` |
+| OAuth 临时回调 | 本机 `1455` 端口，仅登录过程中使用 |
+
+**不要将本服务直接暴露到公网或不可信局域网。** 模型请求可以触发客户端已授权的工具，代理并不会替代客户端的权限与审批机制。
+
+## 安装
+
+### 准备条件
+
+1. 安装 **Git** 和 **Python 3.11 或更高版本**。
+2. 准备 Codex，或能够使用 Responses 协议的客户端。
+3. 准备有权访问 BPS 的 ChatGPT 账号。使用独立 OAuth 登录不需要安装 Excel；只有复用 Excel 会话时才需要已登录官方 ChatGPT 插件的桌面 Excel。
+4. 确保本机 `8001` 端口可用；登录时还需要 `1455` 端口可用。
+5. 网络应能访问 GitHub、依赖下载源及登录和推理服务。需要网络代理时，启动后可在控制台配置出站代理。
+
+每台电脑都应单独创建虚拟环境并登录。**不要复制其他电脑的 `.venv` 或加密凭证文件来完成安装。**
+
+### Windows（PowerShell）
+
+在准备放置项目的目录打开 PowerShell：
+
+```powershell
+git clone https://github.com/autumnleaf-hub/ghcp_proxy_fzy.git
+cd ghcp_proxy_fzy
+
+py -3 --version
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+.\.venv\Scripts\python.exe .\proxy.py
 ```
 
-## Quick Start
+确认版本输出不低于 Python 3.11。如果 `py` 不存在，先正确安装 Python；也可以使用已确认版本的 Python 可执行文件创建虚拟环境。后续安装依赖、启动和测试都使用本项目 `.venv` 内的解释器，不需要激活环境。
 
-### Prerequisites
+看到服务启动后，在浏览器打开 `http://127.0.0.1:8001/ui`。前台运行时不要关闭 PowerShell 窗口；按 `Ctrl+C` 可停止服务。
 
-* Python 3.11 or newer
-* GitHub Copilot access when using the Copilot backend
-* Codex, the ChatGPT app, or Claude Code for the client you want to configure
-* Excel desktop with the official ChatGPT add-in signed in when using the Excel backend
+完成依赖安装后，可以改用项目根目录的 **`BPS-Manager.exe`** 启动和管理服务，详见[日常启动与停止](#日常启动与停止)。
 
-### macOS and Linux
+### macOS / Linux
 
-From the repository directory:
+在终端执行：
 
 ```bash
+git clone https://github.com/autumnleaf-hub/ghcp_proxy_fzy.git
+cd ghcp_proxy_fzy
+
+python3 --version
 python3 -m venv .venv
 ./.venv/bin/python -m pip install --upgrade pip
 ./.venv/bin/python -m pip install -r requirements.txt
-./.venv/bin/python proxy.py
+
+./.venv/bin/python ./proxy.py
 ```
 
-### Windows PowerShell
+确认 `python3` 至少为 3.11。若系统缺少 `venv` 支持，先通过系统包管理器补齐，再创建虚拟环境。
 
-From the repository directory:
+浏览器打开 `http://127.0.0.1:8001/ui`。该方式前台运行，按 `Ctrl+C` 停止；Windows 托盘管理器不能在 macOS / Linux 上运行。
+
+**平台差异：** 当前 Windows 凭证支持加密持久化，其他平台的多凭证 / OAuth 状态仅保存在内存中。重启后可能需要重新登录；macOS 的 Excel 会话可从已登录插件的本地存储重新读取，Linux 不提供同等的桌面 Excel 会话读取方式。
+
+以上手动安装流程不要求 Node.js 或 `npx`。仓库中的 `install_macos.sh` 仍带有历史 Node.js 检查和旧目录约定，建议以本文手动命令为准。
+
+## 首次登录与验证
+
+### 方式一：独立登录 ChatGPT（无需 Excel）
+
+1. 启动代理，打开控制台。
+2. 在首次设置中选择 **“登录 ChatGPT（无需 Excel）”**，或进入 **“凭证与登录” → “添加登录”**。
+3. 在打开的官方登录页面完成授权。使用 OAuth + PKCE 流程，代理不接收你的账号密码。
+4. 登录完成后返回控制台，找到新增凭证，点击 **“验证 BPS”**。
+5. 确认验证结果及启用状态，再连接客户端。
+
+注意：
+
+- OAuth 登录期间本机监听 `127.0.0.1:1455`，回调地址使用 `http://localhost:1455/auth/callback`；登录流程约 10 分钟超时，一次完成一个账号。
+- 不要同时启动其他占用 `1455` 端口的 Codex / CPA 登录流程。
+- **验证 BPS 会发送一个小型模型请求，可能消耗额度。** OAuth 授权成功本身不能证明模型访问权限。
+- 同一个账号再次登录会更新已有条目，不是无限新增重复凭证。
+
+### 方式二：复用 Excel 插件会话
+
+- **Windows**：在桌面 Excel 中打开官方 ChatGPT 插件并登录；代理可从 Office WebView2 本地存储发现会话。
+- **macOS**：在桌面 Excel 中打开并登录 ChatGPT 插件；代理可读取 Excel 使用的 WebKit 本地会话。
+- 如果未发现会话或会话过期，重新打开 / 刷新插件，再回到控制台检查和验证。
+
+无需抓包、开发者工具、调试端口或安装自定义证书。Excel 会话与独立 OAuth 是不同凭证来源，不应通过手动复制浏览器令牌来替代正常登录。
+
+## 连接 Codex
+
+### 使用控制台配置
+
+1. 确认至少一个凭证已启用并通过 BPS 验证。
+2. 在 **“概览”** 页的客户端路由提示中，点击 **“启用代理：Codex”**。
+3. 完全退出并重新打开 Codex，让客户端重新读取配置和模型目录。
+4. 选择可用 BPS 模型，发送一个简单请求，并在控制台 **“请求”** 页确认记录。
+
+启用会修改本机 Codex 配置，项目会备份被修改的配置。设置页另有 **“代理退出时恢复 Codex 和 Claude 的原始配置”** 选项，请按自己的使用方式选择；如果启用恢复，代理退出后客户端可能重新使用原配置。
+
+**不要为了使用 Codex 而点击“全部启用”。** 界面保留了部分 Claude 配置入口，但当前分支的 Anthropic Messages 接口不可用，启用 Claude 代理并不代表能够正常推理。
+
+### 手动配置（可选）
+
+更推荐使用控制台，以便同时维护配置备份和模型目录。需要手动配置时，先备份 `~/.codex/config.toml`，再合并以下配置，不要覆盖现有的 MCP、项目和其他个人设置：
+
+```toml
+model_provider = "custom"
+model = "gpt-6-sol-excel"
+approvals_reviewer = "user"
+
+[model_providers.custom]
+name = "OpenAI"
+base_url = "http://127.0.0.1:8001/v1"
+wire_api = "responses"
+```
+
+如果文件已有同名字段或表，应修改原配置，不能重复添加 TOML 表。模型名称可按账号实际权限替换；手动片段不会自动生成项目维护的模型目录。修改后重启 Codex。
+
+本机代理的 Base URL 不应填写为网络代理地址，也不要将 ChatGPT OAuth 令牌填入客户端配置。
+
+## 日常启动与停止
+
+### Windows 托盘管理器
+
+双击仓库根目录的 `BPS-Manager.exe`，可查看服务状态、设置监听端口、启动 / 停止代理、打开网页控制台及设置当前用户登录 Windows 时自启动。
+
+- **它不是完整的 Python 独立安装包。** 管理器仍需要同目录下的 `proxy.py`、项目代码和 `.venv\Scripts\python.exe`；不能只复制 EXE 到其他电脑使用。
+- 关闭窗口的 **X** 会隐藏到托盘，不等于停止代理。右键托盘图标可重新打开或退出；退出管理器与停止服务是不同操作，请按提示选择。
+- 改变监听端口后，客户端 Base URL 也要同步更新。
+- 管理器会核对进程所有者、项目路径和服务身份，不会仅按端口号强制结束其他程序。
+- 更新 EXE 前应退出托盘管理器，避免 Windows 文件占用导致拉取失败。
+
+如果更改仓库位置，请重新打开新位置的管理器并检查自启动设置，不要保留指向旧位置的启动项。
+
+### 命令行运行
+
+Windows：
 
 ```powershell
-py -3 -m venv .venv
-./.venv/Scripts/python.exe -m pip install --upgrade pip
-./.venv/Scripts/python.exe -m pip install -r requirements.txt
-./.venv/Scripts/python.exe ./proxy.py
+.\.venv\Scripts\python.exe .\proxy.py
 ```
 
-Then open `http://127.0.0.1:8001/`.
-
-On the first run:
-
-1. Sign in to GitHub if prompted.
-2. Open **Integrations**.
-3. Enable the clients you want to use.
-4. Optionally install the start and stop commands.
-5. Optionally enable startup at login.
-6. Restart any clients that were already running.
-
-Node.js, `npx`, and manually edited client configuration files are not required for normal setup.
-
-## Daily Use
-
-Start the proxy with the repository virtual environment:
+macOS / Linux：
 
 ```bash
-./.venv/bin/python proxy.py
+./.venv/bin/python ./proxy.py
 ```
 
-If you installed the helper commands:
+所有命令都从仓库根目录执行。不要同时启动多个占用相同端口的代理；停止前先等待重要请求完成。
+
+## 控制台与设置
+
+### 页面说明
+
+| 页面 | 用途 |
+| --- | --- |
+| 概览 | 运行状态、汇总信息及客户端路由提示 |
+| 用量分析 | 查看本地记录的 Token 和费用估算 |
+| 请求 / 会话 | 排查请求错误、查看会话与用量记录 |
+| 模型路由 | 管理调用名称、内置别名和目标模型 |
+| 审批路由 | 查看及配置项目提供的审批路由选项 |
+| 设置 | 并发队列、出站代理、调试日志、配置恢复及更新 |
+| 凭证与登录 | 添加、验证、启用、停用、重命名和删除凭证 |
+
+### 并发限制与等待队列
+
+在 **“设置” → “并发限制与等待队列”** 中配置：
+
+| 设置 | 默认值 | 含义 |
+| --- | --- | --- |
+| 并发限制 | `0` | `0` 表示无限制；正整数表示该代理进程最多同时处理的推理请求数 |
+| 等待队列大小 | `10` | 达到并发上限后的最多等待请求数；`0` 表示不排队 |
+
+例如设置 **并发 `3`、队列 `10`**：
+
+- 最多 3 个请求正在处理，另有最多 10 个请求等待。
+- 等待请求按先进先出顺序获得空闲位置。
+- 在 3 个请求处理、10 个请求等待的情况下，新到请求立即返回 **HTTP `429`**，错误码为 **`concurrency_queue_full`**，不会转发上游或加入队列。
+- 这里的“丢弃”是明确拒绝该次请求，不是让连接无响应；客户端是否重试由客户端决定。
+
+流式请求从开始处理到结束或取消一直占用并发位置；排队客户端断开会移除等待项。压缩请求和 BPS 验证也计入限制，管理与状态接口不占用推理位置。调低配置不会主动取消已在执行或等待的请求。
+
+保存成功后配置立即生效，并写入用户配置目录下的 `request-concurrency.json`。并发为 `0` 时不因该限制排队，队列容量不限制正常请求。首次升级到包含此功能的版本后，必须先重启 Python 服务，不能只刷新页面。
+
+### 出站代理
+
+设置页预填地址 `http://127.0.0.1:7890`，**默认关闭**。这是代理服务访问上游时使用的网络代理，不是 Codex 的 API Base URL。
+
+- 关闭显式代理时，沿用既有环境代理行为，不等同于强制直连。
+- 开启后，BPS 推理、图片上传和 OAuth 换票 / 刷新使用指定 HTTP(S) 代理；连接失败不会静默回退直连。
+- 显式代理设置不受环境 `NO_PROXY` 等覆盖，保留 TLS 证书校验。
+- 不支持在代理 URL 中保存明文用户名 / 密码，也不能指向本服务自身。
+- 保存后新请求使用新配置，不会主动关闭已经进行的流。
+
+### 模型路由
+
+本地注册的目标模型包含 `gpt-6-astra`、`gpt-6-sol`、`gpt-6-luna`、`gpt-5.6-luna`、`gpt-5.6-terra` 和 `gpt-5.6-sol`；规范的 `-excel` 名称可直接使用，例如 `gpt-6-sol-excel`。
+
+内置规则提供裸名称和 `-basispoints` 别名，可修改、启停或删除；自定义规则优先，内置规则独立于自定义映射开关。规则只匹配一次，不递归。没有匹配到规则的名称（包括已删除 / 停用的别名）统一回退到 `gpt-6-astra-excel`，不会去请求 Copilot。
+
+**模型出现在列表中不代表账号一定有权限。** 如需确认请求实际走到哪个模型，请检查请求记录；推理强度以当前客户端模型目录公布的选项为准。
+
+### 多凭证与故障切换
+
+新会话轮询可用凭证，同一会话尽量保持原凭证。认证失败、额度不足、限流或暂时上游错误可能触发凭证暂停 / 冷却；在尚未输出且允许安全重放时，一次请求最多尝试 3 个不同凭证。已经开始输出的流不会自动重放，避免重复执行工具。
+
+删除或停用凭证可能影响绑定会话。跨账号无法恢复的加密历史、仅服务端保存的上下文或没有原文件的账号专属附件，可能需要新建会话或重新上传文件；故障切换并不保证所有历史都能迁移。
+
+## 升级
+
+### 其他电脑直接 `git pull` 就行吗？
+
+**不能只拉取后继续使用旧进程。** `git pull` 更新的是磁盘文件，已经运行的 Python 服务不会自动加载新代码。推荐完整流程：
+
+1. 等待当前请求完成，停止代理；Windows 还应退出托盘管理器。
+2. 在该电脑的仓库目录检查本地修改，拉取代码。
+3. 使用该电脑的项目虚拟环境同步依赖。
+4. 重新启动代理 / 管理器，刷新网页控制台；客户端配置或模型目录有变化时也重启 Codex。
+
+若确认此次更新没有任何依赖变化，第 3 步可以跳过；**不确定就执行安装依赖命令**。不要仅复制 Python 文件或 EXE 来代替完整更新。
+
+### Windows 升级命令
+
+先停止服务并退出管理器，再在仓库根目录执行：
+
+```powershell
+git status --short --branch
+git pull --ff-only
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+**任一步骤失败都先停下排查，不要带着失败结果继续启动。** 成功后双击 `BPS-Manager.exe` 启动服务，或执行：
+
+```powershell
+.\.venv\Scripts\python.exe .\proxy.py
+```
+
+### macOS / Linux 升级命令
+
+停止正在运行的服务，再在仓库根目录执行：
 
 ```bash
-start-ghproxy
+git status --short --branch
+git pull --ff-only && ./.venv/bin/python -m pip install -r requirements.txt
 ```
 
-On Windows PowerShell:
-
-```powershell
-Start-GHProxy
-```
-
-After changing an integration, restart the affected client so it reloads its provider configuration.
-
-## Backends
-
-### GitHub Copilot
-
-GitHub Copilot is the default backend. Use it when your GitHub account has Copilot access.
-
-### ChatGPT Excel
-
-Some organizations enable the official ChatGPT add-in for Excel without enabling ChatGPT for Work or direct Codex access.
-
-Because the Excel add-in already provides an authenticated OpenAI backend and can support code-execution workflows, similar coding tasks can be performed from Excel. However, reproducing an agent such as Codex inside Excel requires additional prompting and orchestration.
-
-GHCP Proxy removes that indirection by connecting Codex directly to the backend available through the authenticated Excel add-in session. This lets Codex handle the coding workflow while the model requests use the organization's existing Excel access.
-
-In current testing, this has used substantially fewer tokens than recreating a comparable Codex workflow through a large orchestration prompt inside Excel. This is an observed result, not a guaranteed token-reduction ratio.
-
-Use one of these model names to select the Excel route automatically:
-
-```text
-gpt-6-astra
-gpt-6-sol
-gpt-6-luna
-gpt-5.6-luna
-gpt-5.6-terra
-gpt-5.6-sol
-```
-
-The models use the Excel adapter reasoning levels: `low`, `medium`, `high`, and `xhigh`; Astra supports `medium`, `high`, and `xhigh`. `x-high` is accepted as an alias for `xhigh`.
-
-The `-excel` suffix is optional for all models listed above. Existing names such as `gpt-5.6-sol-excel` remain supported, as do `gpt-6-sol-excel` and `gpt-6-luna-excel`. Both forms are advertised by `/v1/models` and route through the Excel session for `/v1/responses` and `/v1/responses/compact`, even when the Copilot SDK is enabled. Other models continue to use GitHub Copilot.
-
-No Excel-specific prompt prefix or additional prompting syntax is required.
-
-## Standalone ChatGPT login (experimental, no Excel install)
-
-This fork defaults to **port 8001** (`GHCP_PORT` overrides it). It uses
-`ghcp_proxy_fzy` for runtime/config/cache state and a separate model catalog,
-leaving a proxy on port 8000 with its own PID, credentials, and settings.
-Legacy state is not imported. Do not enable client proxy settings until you
-intend to switch clients away from the old instance.
-
-Start from the repository on Windows:
-
-```powershell
-./.venv/Scripts/python.exe proxy.py
-```
-
-1. Open `http://127.0.0.1:8001/` and select **Sign in with ChatGPT (no Excel)**
-   in setup or Integrations, under GPT Excel / BPS.
-2. Complete official OpenAI sign-in. This follows CPA/Codex OAuth with PKCE;
-   the proxy never receives your password.
-3. The callback listens on **127.0.0.1:1455** while login is pending
-   (10-minute timeout). Do not run a CPA/Codex login at the same time.
-4. Return and click **Test BPS access**. This sends a small `gpt-6-sol` request
-   and may consume credits. **OAuth success does not prove BPS access**:
-   token audience, workspace permissions, or model availability may differ.
-
-Access and refresh tokens use Windows DPAPI encryption in the new state
-directory. Other platforms keep credentials in memory. Tokens refresh before
-BPS requests near expiry. The Excel cache reader cannot overwrite OAuth.
-Manage each saved credential separately in **登录凭证** (add, enable/disable, verify, rename, delete). New OAuth logins add or update an account instead of replacing the pool. This implementation does not read or modify EasyCLIProxyAPI's saved accounts.
-
-Local actions (JSON, same-origin): `POST /api/config/excel-oauth/start`,
-`POST /api/config/excel-oauth/cancel`, `POST /api/config/excel-oauth/test`.
-Status is in `GET /api/config/excel-session`; credentials and callback codes
-are not returned in status or logged.
-
-OAuth reference: `router-for-me/CLIProxyAPI`,
-`internal/auth/codex/openai_auth.go`. BPS compatibility remains experimental
-until the explicit inference check succeeds for your account.
-
-## Windows 桌面管理器
-
-项目根目录的 `BPS-Manager.exe` 是轻量托盘管理器，使用 Windows .NET Framework / WinForms，依赖本项目已有 `.venv/Scripts/python.exe` 和 `proxy.py` 启动代理；不是整个 Python 服务的独立打包版。
-
-- 小卡片提供服务状态、打开 `/ui` 管理页面、启动/停止、监听端口（默认 8001）及当前用户登录 Windows 时自启动。端口变化后，API 客户端的 Base URL 也需要相应修改。
-- 顶栏空白处可拖动，最小化按钮缩至任务栏；X 关闭窗口隐藏到系统托盘；右键托盘可重新打开及退出。托盘管理器退出与停止服务是不同操作，按退出提示选择，不会因误点窗口关闭而断开服务。
-- 启停前验证监听端口、进程所有者、项目目录、PID / 创建时间及实例 ID，不会按端口号盲目终止程序。更新后的 `python proxy.py` 无论由控制台还是管理器启动，均支持管理器请求正常退出；旧版本或无法证明身份的进程会拒绝或要求明确确认，不能将“端口占用”等同于“本项目服务”。
-- 本次新增 `GET /api/desktop/identity` 和 `POST /api/desktop/stop`，仅限本机同源。停止需要当前 PID 和实例 ID；过期实例返回 409。源码和可复现编译脚本位于 `tools/desktop-manager`。
-- 网页不再提供旧后台代理 / 终端命令安装卡片；已有终端入口不因移除界面而被自动卸载。
-
-### 自动更新开关
-
-设置页面可关闭 / 开启自动更新检查。开关持久保存，关闭后取消后台检查，之后启动也不主动检查；重新开启恢复定时任务，不重启代理。`GHCP_AUTO_UPDATE` 若被显式设置，则优先于界面设置，界面会显示环境变量控制。该开关不改变开发者模式及本地修改保护；关闭也不删除未提交代码。
-
-## BPS 路由、出站代理与多凭证
-
-本版本仅启用 BPS 上游。`/v1/responses` 和 `/v1/responses/compact` 先匹配启用的规则，未匹配的模型名（包括停用或删除的别名）统一回退 `gpt-6-astra-excel`，不会再尝试 Copilot。非字符串 model 返回 400。Copilot 登录、凭证读取/刷新、SDK 及后台扫描均硬禁用，旧环境变量不能重新启用；模型发现仅返回本地 BPS 目录。原 Copilot 专用 Chat Completions / Anthropic Messages 入口返回 501，并提示改用 Responses。
-
-
-- **模型路由**：左侧输入一个或多个调用名称（半角或中文逗号分隔），右侧选择本框架注册的 BPS 模型。列表仅包含 Astra / Sol / Luna 三个 GPT-6 模型及原有三个 GPT-5.6 模型，不再从通用价格表填入 Opus 等不可用模型。重复别名、空别名和未知目标会被拒绝。旧规则中的不支持目标会提示迁移警告，不会让设置页面失效。
-- **内置别名可管理**：模型路由页默认列出六组裸模型名 / `-basispoints` 别名，可修改目标、启停或删除。内置规则独立于自定义映射总开关，自定义规则优先；明确保存为空不会重新生成。规范的 `-excel` 名称仍可直接使用；实际 BPS 请求使用对应裸名称。规则只匹配一次，不递归。该适配器的原生端点为 `/v1/responses` 和 `/v1/responses/compact`。模型列出不等于每个账号均有访问权限。
-- **出站代理**：设置中预填 `http://127.0.0.1:7890`，默认关闭。关闭表示沿用既有环境代理行为；开启后，BPS 推理、图片上传和 OAuth 换票/刷新使用指定 HTTP(S) 代理，忽略环境 `NO_PROXY` 等覆盖，不在连接失败时偷偷直连。显式代理连接保持 TLS 证书校验。不支持在代理 URL 中明文保存用户名/密码，也不能指向本服务自身。保存后新请求采用新设置，进行中的流不会被关闭。
-- **登录凭证**：支持最多 32 个凭证；同账号重新登录更新既有条目。优先显示登录邮箱，另保留自定义标签；无可恢复邮箱的旧会话明确提示邮箱不可用，不猜测账号。可设置名称、启停、单独验证和删除。OAuth 回调仍使用本机 1455 端口，一次完成一个登录流程。验证会发送一个小型模型请求，可能消耗额度。框架不会自动登录其他账号。
-- **负载均衡和故障切换**：新会话轮询可用凭证，同会话优先保持原凭证。认证失败、额度/限流或暂时上游故障会暂停/冷却该凭证，并在尚未输出内容时最多尝试 3 个不同凭证；支持 HTTP 错误和流式握手后的早期 SSE 失败。已开始输出的请求不自动重放，避免重复工具调用。可主动启用凭证或重新登录恢复暂停账号。
-- **跨账号上下文**：切换时从原始本地图片/附件重新上传，移除原账号的加密推理；可读的本地压缩摘要继续保留。仅服务器持有的历史、不可解码的压缩上下文或没有原文件的账号专属附件不能安全迁移，会明确返回错误，要求完整本地历史、新建会话或重新上传，不会静默丢弃上下文。
-- Windows 使用当前用户 DPAPI 加密并原子保存凭证、刷新令牌和有限的会话绑定。其他平台目前仅驻留内存，界面会说明。旧单账号凭证自动迁移一次；删除和停用不会被旧缓存或刷新悄悄撤销。管理接口仅允许本机同源 JSON 请求，状态接口不返回令牌或原始账号 ID。
-
-管理 API：`GET/POST /api/config/outbound-proxy`、`GET /api/credentials`、`POST/DELETE /api/credentials/{id}`、`POST /api/credentials/{id}/test`。保存设置无需重启；首次部署本次代码更新需要操作者自行重启服务。
-
-## Excel Setup
-
-The Excel backend uses the authenticated session created by the official ChatGPT add-in.
-
-It does not require network capture, DevTools, a debugging port, custom certificates, or operating-system proxy changes.
-
-### Windows
-
-Excel desktop must have the ChatGPT add-in signed in at least once. GHCP Proxy discovers the session from Office WebView2 local storage.
-
-Check the detected session status with:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8001/api/config/excel-session
-```
-
-### macOS
-
-Excel desktop must have the ChatGPT add-in open and signed in. GHCP Proxy discovers the session from the local WebKit storage used by Excel.
-
-If the session is missing or expired, reopen or refresh the signed-in Excel task pane and retry the request.
-
-### Clear the Excel Session
-
-Clear the cached session without stopping the proxy:
-
-```powershell
-Invoke-RestMethod -Method Delete http://127.0.0.1:8001/api/config/excel-session
-```
-
-Then reopen or refresh the ChatGPT add-in before retrying.
-
-## Usage and Billing
-
-The dashboard tracks usage and provides local cost estimates by backend and token type.
-
-GitHub Copilot and Excel-backed usage are tracked separately. Provider-side usage and billing records remain authoritative.
-
-The Excel route uses access already available through the authenticated Excel add-in session. GHCP Proxy does not create or modify organizational entitlements.
-
-For current GitHub Copilot pricing and limits, see:
-
-* [Models and pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
-* [Usage limits](https://docs.github.com/en/copilot/concepts/rate-limits)
-
-## Integrations
-
-The dashboard's **Integrations** page manages local client configuration. It can:
-
-* connect Codex to GHCP Proxy
-* connect the ChatGPT app to GHCP Proxy
-* connect Claude Code to GHCP Proxy
-* install start and stop commands
-* enable or disable startup at login
-* restore previous client configuration when an integration is disabled
-
-Existing client configuration is backed up before replacement. Most users should manage integrations through the dashboard rather than editing configuration files manually.
-
-## Configuration
-
-Set environment variables before starting the proxy.
-
-| Variable                        | Purpose                                     | Default or notes               |
-| ------------------------------- | ------------------------------------------- | ------------------------------ |
-| `GHCP_UPSTREAM_TIMEOUT_SECONDS` | Timeout for upstream non-streaming requests | `300` seconds                  |
-| `GHCP_UPSTREAM_PROXY`           | Proxy for HTTP and HTTPS upstream traffic   | Can be overridden per protocol |
-| `GHCP_HTTP_PROXY`               | HTTP upstream proxy                         | Optional                       |
-| `GHCP_HTTPS_PROXY`              | HTTPS upstream proxy                        | Optional                       |
-| `GHCP_NO_PROXY`                 | Hosts excluded from proxying                | Optional                       |
-| `GHCP_UPSTREAM_TLS_VERIFY`      | Upstream TLS certificate verification       | Configure as required          |
-| `GHCP_UPSTREAM_HTTP2`           | HTTP/2 for upstream requests                | Configure as required          |
-
-Standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables are also honored.
-
-### Request Concurrency and Queue
-
-The dashboard **Settings** page includes a global concurrency limit and a
-bounded FIFO queue. The concurrency limit defaults to **0** (unlimited); the
-waiting queue defaults to **10** requests. With a finite limit, requests wait
-until a slot is released. Requests arriving when the queue is full receive
-HTTP **429** with `concurrency_queue_full` and are not sent upstream. A queue
-capacity of **0** disables waiting.
-
-The limit covers Responses, Responses Compact, Chat Completions, Messages and
-BPS verification requests. Streaming requests hold their slot until completion
-or cancellation. Disconnected queued requests are removed. Management and
-status endpoints remain available even when all slots and queue entries are used.
-Lowering limits does not cancel requests that are already active or queued.
-
-Settings are saved atomically in `request-concurrency.json` in the user config
-directory and apply immediately after a successful save. Restart the proxy once
-after installing this feature to load the new backend; later settings changes
-do not require restarting. Regression tests use small finite limits, primarily
-**3**, isolated configuration files and fake requests, not unrestricted traffic.
-
-### Enterprise Proxy Example
+两步成功后启动：
 
 ```bash
-export GHCP_UPSTREAM_PROXY=http://proxy.example.com:8080
-export GHCP_UPSTREAM_TLS_VERIFY=1
-export GHCP_UPSTREAM_HTTP2=0
-
-./.venv/bin/python proxy.py
+./.venv/bin/python ./proxy.py
 ```
 
-## Troubleshooting
+### 有本地修改、分支分叉或旧版本时
 
-### Missing Python packages
+- `git status` 显示未提交修改时，先备份或提交自己的代码。不要为了升级直接运行 `git reset --hard` 或删除整个仓库。
+- `git pull --ff-only` 因分支分叉失败时，先检查本地提交，再决定如何合并；不要盲目强制覆盖。
+- 缺少 `.venv`、更换 Python 版本或从 ZIP 安装时，按[安装](#安装)中的流程重新准备环境。ZIP 目录没有 Git 历史，不能直接 `git pull`；建议另建 Git 克隆目录，并重新检查配置及启动路径。
+- Windows 提示 `BPS-Manager.exe` 被占用时，确认已从托盘退出，而不是只关闭窗口。
+- 旧服务无法被新管理器识别时，在原启动终端正常停止，再通过新版启动；不要结束无法确认身份的进程。
 
-Install dependencies and launch the proxy using the same virtual environment:
+### 控制台更新功能
+
+设置页提供自动检查开关、立即检查和拉取更新；检查开关持久保存，默认开启。环境变量 `GHCP_AUTO_UPDATE` 如有设置会优先控制开关。
+
+**自动检查不等于依赖已安装、所有进程已重启。** 使用页面拉取后，请根据提示检查依赖并在安全时机重启；涉及依赖、管理器 EXE 或跨多个版本升级时，优先使用上面的手动流程。有本地代码修改时，先了解用户 / 开发者模式和冲突提示，不要随意使用覆盖操作。
+
+### 升级后检查
+
+- 打开控制台，确认页面可用、凭证状态正常。
+- 检查模型路由、出站代理、并发限制等设置是否符合预期。
+- 确认 Codex 仍指向正确端口；需要时重新启用客户端代理并重启客户端。
+- 若要验证真实模型访问，主动点击“验证 BPS”或发送一个小请求；这可能消耗额度。
+- 可用 `git log -1 --oneline` 查看本机代码版本。其他电脑不会因为这一台推送或升级而自动更新，需各自执行升级流程。
+
+## 数据保存与备份
+
+默认应用目录名为 **`ghcp_proxy_fzy`**，与历史 `ghcp_proxy` 实例隔离。
+
+| 平台 | 配置 | 运行状态 / 日志 | 缓存 |
+| --- | --- | --- | --- |
+| Windows | `%APPDATA%\ghcp_proxy_fzy` | `%LOCALAPPDATA%\ghcp_proxy_fzy` | `%LOCALAPPDATA%\ghcp_proxy_fzy\Cache` |
+| macOS | `~/Library/Application Support/ghcp_proxy_fzy` | 同配置目录 | `~/Library/Caches/ghcp_proxy_fzy` |
+| Linux | `~/.config/ghcp_proxy_fzy` | `~/.local/state/ghcp_proxy_fzy` | `~/.cache/ghcp_proxy_fzy` |
+
+Linux 遵循相应的 `XDG_*` 目录设置；`GHCP_CONFIG_DIR`、`GHCP_STATE_DIR`、`GHCP_CACHE_DIR` 可覆盖默认位置。控制台显示的实际路径优先于本文默认值。
+
+- Windows 凭证使用当前用户的 DPAPI 加密保存，凭证池文件为 `bps-credentials.dpapi`。**复制到另一台电脑或另一个 Windows 用户下不等于能解密使用**，换电脑应重新登录。
+- 非 Windows 平台当前的 OAuth / 多凭证仅保存在内存中，不能依赖普通目录备份恢复这些登录状态。
+- 并发、路由等配置以及本地运行数据不随 Git 推送同步；升级代码通常不需要删除这些目录。
+- Codex 配置保存在 `~/.codex`，项目生成的模型目录为 `ghcp-proxy-fzy-models.json`。备份前注意其中可能包含个人配置或其他服务信息。
+- 托盘管理器自己的状态和日志位于 `%LOCALAPPDATA%\BPS-Manager` 下按项目区分的目录，与 Python 服务状态不同。
+
+需要备份时，先停止代理，再备份对应用户数据目录和客户端配置。凭证、日志、附件、数据库及配置备份都可能含敏感信息，不要提交到 Git 或公开上传。
+
+### 调试日志与隐私
+
+完整提示词 / 请求体调试记录默认关闭，由设置中的 `debug_prompt_logging_enabled` 控制。排查问题时才临时开启，复现后关闭。`request-trace.jsonl` 可用于关联请求 ID，完整记录也可能包含提示词、文件内容和工具参数；分享日志前必须脱敏。
+
+## 接口与高级配置
+
+### 主要接口
+
+| 方法与路径 | 用途 / 限制 |
+| --- | --- |
+| `GET /v1/models` | 本地 BPS 模型目录，不代表所有模型已获授权 |
+| `POST /v1/responses` | 主要推理入口，支持流式和非流式请求 |
+| `POST /v1/responses/compact` | 兼容上下文压缩与摘要回放 |
+| `POST /v1/files` | 上传本地附件，使用 multipart 表单 |
+| `GET /v1/files`、`GET /v1/files/{id}`、`GET /v1/files/{id}/content` | 列表、元数据和内容 |
+| `DELETE /v1/files/{id}` | 删除本地附件 |
+| `GET/POST /api/config/concurrency` | 读取状态 / 保存并发和队列配置 |
+| `GET /api/credentials`、`POST/DELETE /api/credentials/{id}` | 凭证列表、修改与删除 |
+| `POST /api/credentials/{id}/test` | 验证指定凭证的 BPS 权限，可能消耗额度 |
+| `POST /v1/chat/completions`、`POST /v1/messages` | 当前分支不提供推理支持，返回 `501` |
+
+本机管理写接口要求同源检查和 `Content-Type: application/json`，包括删除凭证请求。不要为了方便调用而移除这些安全检查。附件接口有自己的输入和访问检查，不应将这条 JSON 要求套用到 multipart 文件上传。
+
+### 图片、文件与工具的边界
+
+- 支持单图、多图、纯图片以及文字和图片交错输入；图片保留顺序，但仍受上游大小、格式和上下文限制。
+- 本地文件上传、客户端工具读取文件、BPS 账号下的附件是不同流程；并非任意 `input_file`、远程文件 ID 或不透明压缩历史都能在账号之间通用。
+- 浏览器、MCP、终端和计算机操作依赖当前客户端实际提供的工具及权限，代理不会凭空增加未启用工具。
+- 工具参数会校验当前目录与 JSON Schema；非法调用不会执行。部分转换错误可尝试一次纠正，失败时返回带请求 ID 的安全诊断，不无限重试。
+- 批量传输能力不等于上游保证稳定并行调用；不能仅凭离线转换成功就宣称所有模型支持原生多工具并行。
+
+### 常用环境变量
+
+环境变量应在启动服务前设置；与界面设置同时存在时，按各项说明判断优先级。
+
+| 变量 | 用途 |
+| --- | --- |
+| `GHCP_PORT` | 监听端口，默认 `8001`；仅绑定 `127.0.0.1` |
+| `GHCP_CONFIG_DIR` / `GHCP_STATE_DIR` / `GHCP_CACHE_DIR` | 覆盖配置、状态、缓存目录 |
+| `GHCP_AUTO_UPDATE` | 覆盖自动更新检查开关，如 `0` 关闭 |
+| `GHCP_AUTO_UPDATE_MODE` | 更新模式：`user` 或 `developer` |
+| `GHCP_UPSTREAM_TIMEOUT_SECONDS` | 上游请求超时配置，默认 `300` 秒 |
+| `GHCP_UPSTREAM_PROXY` | HTTP / HTTPS 上游代理；也支持 `GHCP_HTTP_PROXY`、`GHCP_HTTPS_PROXY`、`GHCP_NO_PROXY` |
+| `GHCP_UPSTREAM_TLS_VERIFY` / `GHCP_UPSTREAM_HTTP2` | 高级 TLS 校验与 HTTP/2 行为配置；不要以关闭证书校验作为常规排障方案 |
+
+未启用界面显式出站代理时，也会考虑标准 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 等环境变量。建议普通用户优先使用控制台的出站代理设置。
+
+例如在 Windows PowerShell 中临时使用其他端口并关闭自动更新检查：
+
+```powershell
+$env:GHCP_PORT = "8002"
+$env:GHCP_AUTO_UPDATE = "0"
+.\.venv\Scripts\python.exe .\proxy.py
+```
+
+此时控制台和 API 地址也变成 `8002`。以上环境变量仅作用于当前 PowerShell 及其子进程，不会自动修改从资源管理器启动的托盘管理器配置。
+
+## 常见问题
+
+### 页面打不开 / 端口已被占用
+
+先检查终端或托盘管理器的服务状态，确认启动成功及实际端口。默认控制台是 `http://127.0.0.1:8001/ui`，不是 `8000`。若端口已被其他实例占用，先核实进程身份；不要直接结束不认识的程序。
+
+### 提示缺少 Python 模块
+
+通常是使用了错误的 Python，或升级后没有同步依赖。从仓库根目录执行对应平台的虚拟环境安装命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
 ```bash
 ./.venv/bin/python -m pip install -r requirements.txt
-./.venv/bin/python proxy.py
 ```
 
-Windows PowerShell:
+不要只向系统 Python 安装依赖。`requirements.txt` 会包含附件处理依赖文件，不需要凭报错逐个猜测安装包。
+
+### 登录成功，但验证 BPS 返回 401 / 403
+
+OAuth 成功只证明登录流程完成，不等于拥有 BPS 权限。检查账号 / 工作区权限、凭证有效期以及请求记录中的上游错误；必要时正常重新登录、重新验证。代理可能暂停该凭证，问题解决后再主动启用。
+
+**403 既不能单凭状态码认定永久封号，也没有“自动解封”的保证。** 不要连续高频重试；保留脱敏后的请求 ID 和错误代码用于排查，不要分享令牌、Cookie 或完整凭证文件。
+
+### OAuth 提示 1455 端口忙
+
+完成或取消另一个正在进行的登录流程，再重试。本项目一次只进行一个 OAuth 登录，不需要修改系统代理或关闭无关进程。
+
+### 删除凭证提示 `Use application/json.`
+
+新版页面已为删除请求补上 JSON Content-Type。先更新并强制刷新页面；如果手动调用管理接口，确认 DELETE 请求也携带 `Content-Type: application/json`，且满足本机同源要求。不要取消服务端校验来绕过错误。
+
+### 并发设置请求返回 404 / 页面有功能但保存失败
+
+可能只拉取了文件、旧 Python 服务还在运行。等待请求完成，正常停止后重新启动，再刷新页面。配置接口首次部署必须重启；之后保存并发 / 队列设置不需要重启。
+
+### 请求返回 `concurrency_queue_full`
+
+这是本机排队容量已满，当前请求没有发往上游，不是账号被封。等待后重试，或根据实际资源适当调整并发和队列；不要通过无限重试制造更大的排队压力。
+
+### Codex 仍然连接旧服务 / 选的模型没有按预期使用
+
+确认客户端代理已启用，完全退出并重启 Codex；检查 Base URL、监听端口及模型目录。再检查内置 / 自定义路由规则：未知模型和已停用别名会回退到 Astra，不会走 Copilot。
+
+### 请求超时或网络代理连接失败
+
+先检查出站代理地址和本机代理软件是否正常，再查看上游错误。必要时调整 `GHCP_UPSTREAM_TIMEOUT_SECONDS`，但增加超时不会修复登录权限或网络不通。正在使用本代理的对话中不要直接重启服务，以免中断当前操作。
+
+## 开发与测试
+
+生产模块保留在仓库根目录，测试统一位于 `tests/`。更多说明见 [tests/README.md](tests/README.md)；自动生成的 `mutants/` 不是日常编辑或测试目标。
+
+所有测试从仓库根目录执行，并使用项目虚拟环境。测试使用标准库 `unittest`，不要求 pytest。
+
+### 定向回归
+
+Windows：
 
 ```powershell
-./.venv/Scripts/python.exe -m pip install -r requirements.txt
-./.venv/Scripts/python.exe ./proxy.py
+.\.venv\Scripts\python.exe -X utf8 -B -m unittest tests.test_request_concurrency tests.test_request_concurrency_api tests.test_dashboard_features -v
 ```
 
-### Dashboard does not open
-
-Check the terminal running `proxy.py`.
-
-If it exited, resolve the reported error and restart it. If another process is using port `8001`, stop the old GHCP Proxy instance or conflicting process first.
-
-### GitHub sign-in does not complete
-
-Keep the dashboard open while completing the GitHub device-code flow with the account that has Copilot access.
-
-After approval, return to the dashboard and wait for the status to refresh.
-
-### Client still uses its old provider
-
-Completely restart the client after changing its integration.
-
-If necessary, disable and re-enable the integration from the dashboard and start a new client session.
-
-### Upstream requests time out
-
-Increase the timeout before starting the proxy:
+macOS / Linux：
 
 ```bash
-export GHCP_UPSTREAM_TIMEOUT_SECONDS=600
-./.venv/bin/python proxy.py
+./.venv/bin/python -B -m unittest tests.test_request_concurrency tests.test_request_concurrency_api tests.test_dashboard_features -v
 ```
 
-Windows PowerShell:
+并发回归使用隔离配置和伪请求，主要以并发 `3` 等小规模有限值验证，不测试无限制并发，也不向真实账号发起压力测试。前端 JavaScript 检查需要 Node.js；普通启动服务不需要。
+
+### 全量测试发现
+
+Windows：
 
 ```powershell
-$env:GHCP_UPSTREAM_TIMEOUT_SECONDS = "600"
-./.venv/Scripts/python.exe ./proxy.py
+.\.venv\Scripts\python.exe -X utf8 -B -m unittest discover -s tests -t . -v
 ```
 
-### Excel session is missing or expired
+macOS / Linux：
 
-Open the official ChatGPT add-in in Excel and confirm that it is signed in.
-
-Refresh or reopen the task pane, then check:
-
-```text
-http://127.0.0.1:8001/api/config/excel-session
+```bash
+./.venv/bin/python -B -m unittest discover -s tests -t . -v
 ```
 
-If necessary, clear the cached session and retry.
+请保留 `-t .`，保证测试以 `tests.test_*` 包名导入。部分检查依赖额外平台工具或 `requirements-e2e.txt`，环境不满足时可能跳过；运行前先查看测试说明。
 
-### Excel requests use the wrong backend
+### 构建 Windows 管理器
 
-Make sure the selected model is one of the supported Excel models (the `-excel` suffix is optional):
+普通用户可使用仓库提供的 EXE。修改管理器源码后，可在有 .NET Framework 编译器的 Windows 上执行：
 
-```text
-gpt-6-astra
-gpt-6-sol
-gpt-6-luna
-gpt-5.6-luna
-gpt-5.6-terra
-gpt-5.6-sol
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\desktop-manager\build.ps1 -SelfTest
 ```
 
-The names above and their `-excel` aliases use the Excel backend and require a valid Excel session. Other model names use GitHub Copilot. Restart the proxy after upgrading and refresh generated client configuration to update the model picker.
+这会重新生成根目录的 `BPS-Manager.exe` 并执行管理器自测，构建前应退出正在运行的管理器。
 
+## 许可证
 
-### Codex 文件与工具兼容范围
-
-- 保持 Codex 的本地文件流程：文件路径或附件描述进入上下文，再由客户端文件/终端工具读取。中文、空格、反斜杠和多行参数不会由代理主动改写；实际文件解析仍取决于客户端工具和本机依赖。此项不等于新增 OpenAI `/v1/files` 上传接口，也不承诺任意 `input_file` 可直接交给 BPS。
-- 浏览器、MCP 和 computer-use 走客户端工具转发：保留工具命名空间、调用 ID、自定义工具原始输入以及工具结果中的文字/截图；缓存未命中时重建完整命名空间名称。代理不会自行赋予客户端未启用的桌面控制权限。
-- 桥接转换器可解析同一响应中的多个工具调用，覆盖流式和非流式响应；流式只发送一次完成事件，保留各调用的输出索引。但这不表示上游能够稳定生成并行调用：真实 BPS 双工具请求目前仍可能只返回一条，因此模型能力继续公布 `parallel_tool_calls: false`，不能把离线批量转换测试当作上游并行能力验收。无法匹配客户端目录或参数结构的上游工具调用会以 `tool_conversion_rejected` 助手提示收束本轮（未执行任何工具），不再人为生成 `response.failed` 或 HTTP 502 造成 Codex 硬断流。此提示不是工具执行成功；用户可以继续重试。原生 Excel 工具不直接透传，也不部分派发损坏批次。真实上游失败仍保持失败状态。诊断日志仅含工具名和失败分类，不记录参数内容。
-- 工具参数使用 JSON Schema 校验：支持本地 `$ref` / `$defs`、`oneOf` / `anyOf` / `allOf`、布尔 schema 和 nullable；按客户端实际目录解析命名空间，并保留 `inputSchema` / `input_schema`。禁止读取外部 schema 引用，不会为了参数校验访问网络或本地文件。升级时请使用仓库虚拟环境安装 `requirements.txt` 中新增的 `jsonschema` / `referencing` 依赖。
-- 传输解析只接受单个 JSON 工具对象（兼容明确 JSON 围栏和有限的旧嵌套封装），不执行脚本、不猜测缺失工具名、不从任意代码中抽取调用。 对 JSON 字符串中的裸换行、回车、制表符做保值转义；反斜杠紧接真实控制字符时按控制字符转义处理，保留前面成对的反斜杠，避免凭空多出参数字符。已合法 JSON 优先直接解析，不对合法字面量再次反转义；不猜修缺失引号、逗号或拼接对象，其他非法控制字符仍拒绝。旧文本 marker 也经过相同的目录和参数校验，不能绕过无效原生批次的拒绝。
-- 整批通过校验后才写入工具回放缓存；无效批次不会污染后续上下文。拒绝轮次的孤立加密 reasoning 不再回放，之前成功工具轮次的 reasoning 保留。流末尾缺失最终工具列表时不会透传待决的原生工具事件；真实的上游失败、未完成和截断仍明确保留为失败/未完成。
-- 拒绝日志包含 `request_id`、工具名、请求的命名空间、失败分类、固定字段的结构摘要及当轮有效工具目录（名称、数量、指纹，不含 schema 或参数值）。`malformed_transport` 还记录具体解析阶段。客户端拒绝提示也附请求 ID，便于关联日志。启用现有请求追踪时，`request-trace.jsonl` 额外记录 `client_tool_rejected` 事件（`dispatched: false`），可通过请求 ID 关联原始请求；不会为此开启完整 prompt/body 调试记录。
-- 定向离线回归（Windows）：`.venv/Scripts/python.exe -X utf8 -B -m unittest tests.test_codex_tool_schema tests.test_codex_tool_schema_integration tests.test_client_tool_transport tests.test_codex_bridge_regressions tests.test_codex_transport_recovery tests.test_codex_tool_compat tests.test_excel_images tests.test_excel_upstream -q`。桥接边界测试使用假上游并阻断网络；测试不启动或重启代理监听服务。
-
-### 工具选择与压缩回放
-
-- 按当前请求的 `tool_choice` 执行工具选择：`none` 禁止工具；`required` 要求至少一个合法调用；指定 function/custom 工具时只允许匹配的名称、命名空间和类型。不存在的指定工具在请求入口返回 400，不新增或猜测工具。历史调用仍按完整原始目录回放，不被本轮选择过滤掉。
-- `parallel_tool_calls: false` 时整批最多一条调用；违规批次不部分执行，走同样的一次纠正与安全收束流程。指定工具却只返回正文的完成响应也会尝试一次纠正。
-- 本地生成的兼容压缩项目在送往 BPS 前展开为摘要消息；保留压缩边界后的输入，不重复旧历史。不解析或伪造上游不透明的原生压缩数据。此项修复了本地 `/v1/responses/compact` 结果回放触发的 400。
-
-### 工具转换自动纠正
-
-- 纠正上下文附上原失败工具候选，作为明确标记未执行、不可信的数据；最多 8 项、总 JSON 64 KiB，超限整批省略，不截断或部分派发。末尾纠正指令只允许按原任务和当前目录修复表示形式，避免从头重新规划并重复生成同类封装错误。
-
-- 对已完成但无法转换的上游工具批次（错误封装、工具名不在当前目录、参数不符），在尚未派发任何工具且输出索引可安全保留时，自动请求模型纠正一次；流式、非流式均适用。未知工具不会被加入白名单，错误参数不会被代理猜写，损坏批次不会部分执行。
-- 纠正推理最多一次，总等待上限 120 秒（连接上限 10 秒、写入和连接池等待上限 30 秒；读取受同一 120 秒总预算约束，避免模型生成期间被更短的空闲时限提前切断），可能产生额外模型用量；已报告的两次 token 用量合并计入同一请求。纠正成功后沿原连接返回经过完整校验的工具调用，只发送一次完成事件；如果能力确实不在当轮目录，可返回正常文字说明。
-- 纠正提示要求底层参数值不预转义，再依次序列化客户端对象和外层参数；保留 LF/CRLF、反斜杠、Unicode 与尾随空白。代理不会把已经合法的字面量反斜杠加 n 强行替换成换行；目录与 schema 校验也不等于证明模型生成的命令语义正确。
-- 二次输出仍不合法、纠正超时或失败时，返回带请求 ID 的原有安全诊断，不无限重试。取消会传播，真正上游失败／截断不伪装成成功。已有调用后又出现可见输出等无法安全重新编号的异常结构不自动重放。
-- 纠正结束日志包含独立的 `correction_diagnostic`，区分二次候选状态、结构、工具目录/schema、重复 ID 等拒绝原因；`correction_transport_details` 只记录 JSON 错误类别、位置和长度，不记录原文、参数或片段。原请求诊断仍保留，不再用它冒充二次失败原因。
-- 追踪新增 `client_tool_correction_started` / `client_tool_correction_finished`，记录同一 `request_id`、结果分类、当轮工具目录及 token 用量，不记录原始参数、授权头或异常消息正文。父线程和子线程可能拥有不同工具目录，历史提及不等于本轮可调用。
-
-### BPS 图片输入兼容性
-
-`/v1/responses` 支持单图、多图、纯图片（不需要正文）以及文字与图片交错排列。代理不设置额外图片张数上限、不截断图片、不插入虚构的用户正文；实际仍受上游单图大小、格式、请求体和上下文限制。
-
-- 支持 `input_image.image_url` 字符串、`image_url: {url, detail}`、`image_base64` 配合 `media_type`，以及已有的 `file_id`。
-- 用户消息中的 base64 图片上传为 BPS 附件；历史 `function_call_output` 中的图片保留 inline URL。两处不能一律替换为 `file_id`，否则“历史工具图片 + 新用户图片”会触发 BPS 422。
-- 图片顺序和 `detail` 保留；重复图片在同一账号范围内复用附件缓存，不同账号不会混用文件 ID。
-- 图片参数错误返回带具体输入位置的 400；上游上传失败与参数错误分开报告。
-
-修改代码不会替正在运行的 8001 自动加载新逻辑。若当前会话正在使用该端口，不要在会话中直接重启；请等待安全时机手动重启后再验证。
+本项目沿用仓库中的 [LICENSE](LICENSE)（Unlicense）。账号、客户端及上游服务仍受各自服务条款与授权约束。
