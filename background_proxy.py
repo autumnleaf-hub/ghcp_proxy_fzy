@@ -7,6 +7,8 @@ import sys
 from dataclasses import dataclass
 
 from constants import (
+    PROXY_BASE_URL,
+    PROXY_PORT,
     PROXY_PID_FILE,
     PROXY_STDERR_LOG_FILE,
     PROXY_STDOUT_LOG_FILE,
@@ -28,6 +30,11 @@ PROXY_ENV_KEYS = (
     "GHCP_HTTPS_PROXY",
     "GHCP_HTTP_PROXY",
     "GHCP_NO_PROXY",
+    "GHCP_PORT",
+    "GHCP_APP_DIR_NAME",
+    "GHCP_CONFIG_DIR",
+    "GHCP_STATE_DIR",
+    "GHCP_CACHE_DIR",
 )
 
 
@@ -301,15 +308,15 @@ class BackgroundProxyManager:
 function Start-GHProxy {{
     $client = New-Object System.Net.Sockets.TcpClient
     try {{
-        $client.Connect('127.0.0.1', 8000)
-        Write-Host 'GHCP Proxy is already listening on http://localhost:8000'
+        $client.Connect('127.0.0.1', {PROXY_PORT})
+        Write-Host 'GHCP Proxy is already listening on {PROXY_BASE_URL}'
         return
     }} catch {{ }} finally {{
         $client.Dispose()
     }}
     New-Item -ItemType Directory -Force -Path (Split-Path {pid_file}) | Out-Null
     Start-Process -WindowStyle Hidden -FilePath {python} -ArgumentList @({script}) -WorkingDirectory {repo} -RedirectStandardOutput {stdout} -RedirectStandardError {stderr}
-    Write-Host 'GHCP Proxy started in the background at http://localhost:8000'
+    Write-Host 'GHCP Proxy started in the background at {PROXY_BASE_URL}'
 }}
 
 function Stop-GHProxy {{
@@ -339,13 +346,13 @@ function Stop-GHProxy {{
         stderr = shlex_quote(PROXY_STDERR_LOG_FILE)
         return f"""{START_MARKER}
 start-ghproxy() {{
-  if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "GHCP Proxy is already listening on http://localhost:8000"
+  if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:{PROXY_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "GHCP Proxy is already listening on {PROXY_BASE_URL}"
     return 0
   fi
   mkdir -p "$(dirname {pid_file})"
   (cd {repo} && nohup {python} {script} >> {stdout} 2>> {stderr} &)
-  echo "GHCP Proxy started in the background at http://localhost:8000"
+  echo "GHCP Proxy started in the background at {PROXY_BASE_URL}"
 }}
 
 stop-ghproxy() {{

@@ -161,6 +161,8 @@ class ExcelUpstreamTests(unittest.TestCase):
     def test_each_excel_alias_routes_to_matching_upstream_model(self):
         expected = {
             "gpt-6-astra-excel": "gpt-6-astra",
+            "gpt-6-sol-excel": "gpt-6-sol",
+            "gpt-6-luna-excel": "gpt-6-luna",
             "gpt-5.6-luna-excel": "gpt-5.6-luna",
             "gpt-5.6-terra-excel": "gpt-5.6-terra",
             "gpt-5.6-sol-excel": "gpt-5.6-sol",
@@ -440,15 +442,13 @@ class ExcelUpstreamTests(unittest.TestCase):
                 {
                     "summary": "Inspect repository",
                     "extended_summary": "List repository files",
-                    "code": "const request = "
-                    + json.dumps(
+                    "code": json.dumps(
                         {
                             "name": "shell_command",
                             "arguments": {"command": "Get-ChildItem"},
                         },
                         separators=(",", ":"),
-                    )
-                    + ";",
+                    ),
                     "destructive": False,
                     "references": [],
                 },
@@ -1501,13 +1501,79 @@ class ExcelUpstreamTests(unittest.TestCase):
         payload = excel_upstream.merge_local_models_payload(payload)
         self.assertEqual(
             [item["id"] for item in payload["data"]],
-            [
-                "gpt-5.5",
-                "gpt-5.6-luna-excel",
-                "gpt-5.6-terra-excel",
-                "gpt-5.6-sol-excel",
-            ],
+            ["gpt-5.5", *excel_upstream.PUBLIC_MODEL_IDS],
         )
+
+class ExcelModelAliasTests(unittest.TestCase):
+    def test_base_names_and_legacy_aliases_have_identical_upstreams(self):
+        for base, alias in excel_upstream.EXCEL_MODEL_ALIASES.items():
+            for requested in (base, alias, f" OPENAI/{base.upper()} "):
+                with self.subTest(requested=requested):
+                    self.assertEqual(excel_upstream.excel_model_id(requested), alias)
+                    body = excel_upstream.prepare_responses_body(
+                        {"model": requested, "input": "Hello"}
+                    )
+                    self.assertEqual(body["model"], base)
+                    self.assertEqual(body["model_selection"], "explicit")
+
+    def test_unknown_models_are_not_rerouted(self):
+        for model in (None, {}, 1, "gpt-excel", "gpt-5.4", "gpt-6-unknown", "claude-sonnet-4.6"):
+            with self.subTest(model=model):
+                self.assertFalse(excel_upstream.is_excel_model(model))
+
+    def test_discovery_overrides_copilot_collisions_without_duplicates(self):
+        original = {"object": "list", "data": [
+            {"id": "gpt-6-sol", "owned_by": "copilot"},
+            {"id": "gpt-5.4", "owned_by": "copilot"},
+        ]}
+        payload = excel_upstream.merge_local_models_payload(original)
+        self.assertEqual(payload, excel_upstream.merge_local_models_payload(payload))
+        ids = [item["id"] for item in payload["data"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(set(ids), {"gpt-5.4", *excel_upstream.PUBLIC_MODEL_IDS})
+        for item in payload["data"]:
+            self.assertEqual(item["owned_by"], "copilot" if item["id"] == "gpt-5.4" else "openai-excel")
+        self.assertEqual(original["data"][0]["owned_by"], "copilot")
+
+    def test_both_names_advertise_identical_capabilities(self):
+        original = {"gpt-6-sol": {"provider": "Copilot", "reasoning_efforts": ["max"]}}
+        caps = excel_upstream.merge_local_model_capabilities(original)
+        for base, alias in excel_upstream.EXCEL_MODEL_ALIASES.items():
+            self.assertEqual(caps[base], caps[alias])
+            self.assertEqual(caps[base]["provider"], "OpenAI Excel")
+        self.assertEqual(original["gpt-6-sol"]["provider"], "Copilot")
+
+    def test_astra_reasoning_restriction_applies_to_base_name(self):
+        for model in ("gpt-6-astra", "gpt-6-astra-excel"):
+            body = excel_upstream.prepare_responses_body(
+                {"model": model, "input": "Hello", "reasoning": {"effort": "low"}}
+            )
+            self.assertEqual(body["reasoning_effort"], "medium")
+
+
+class ExcelAliasRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_responses_and_compact_route_before_copilot_sdk(self):
+        from unittest import mock
+        import proxy
+
+        for handler in (proxy.responses, proxy.responses_compact):
+            for model in excel_upstream.PUBLIC_MODEL_IDS:
+                with self.subTest(endpoint=handler.__name__, model=model):
+                    body = {"model": model, "input": "Hello"}
+                    with (
+                        mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+                        mock.patch.object(proxy, "_handle_excel_responses", mock.AsyncMock(return_value="excel")) as excel,
+                        mock.patch.object(proxy, "_handle_copilot_sdk_responses", mock.AsyncMock()) as sdk,
+                        mock.patch.object(proxy.copilot_sdk_upstream, "enabled", return_value=True),
+                        mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value=None),
+                        mock.patch.object(proxy.model_routing_config_service, "resolve_bps_model", return_value=excel_upstream.excel_model_id(model)),
+                    ):
+                        self.assertEqual(await handler(mock.Mock()), "excel")
+                        excel.assert_awaited_once()
+                        self.assertEqual(excel.call_args.args[1]["model"], excel_upstream.excel_model_id(model))
+                        self.assertEqual(excel.call_args.kwargs["source_body"], body)
+                        sdk.assert_not_awaited()
+
 
 class ExcelStreamTransformTests(unittest.TestCase):
     SOURCE_BODY = {

@@ -378,10 +378,11 @@ def has_vision_input(
     value_type = value.get("type")
     if isinstance(value_type, str) and value_type.lower() == "input_image":
         return True
-    content = value.get("content")
-    if isinstance(content, list):
-        return any(has_vision_input(i, depth + 1, max_depth) for i in content)
-    return False
+    return any(
+        has_vision_input(value.get(key), depth + 1, max_depth)
+        for key in ('content', 'output')
+        if isinstance(value.get(key), (list, dict))
+    )
 
 
 def _interaction_type_for_initiator(initiator: str) -> str:

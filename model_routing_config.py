@@ -1,26 +1,44 @@
-"""Persistent configuration for model remapping."""
+"""Persistent, one-step model remapping with literal incoming alias groups.
+
+Main mapping targets and discovery use only excel_upstream.MODEL_IDS. Approval
+routing and Claude client defaults retain their independent legacy catalog.
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
+import unicodedata
 from dataclasses import dataclass
 
 from fastapi import HTTPException
 
+import excel_upstream
 import format_translation
-from constants import DEFAULT_COMPACT_FALLBACK_MODEL, MODEL_PRICING, MODEL_ROUTING_CONFIG_FILE, TOKEN_DIR
+from constants import DEFAULT_COMPACT_FALLBACK_MODEL, MODEL_PRICING, MODEL_ROUTING_CONFIG_FILE
 from util import _normalize_model_name
 
 
+MAX_ROUTING_MODEL_NAME_LENGTH = 256
+# Shared across service instances: read/merge/write is one transaction in-process.
+# Same-directory os.replace also keeps readers in other processes from seeing
+# partial JSON. Cross-process writers are intentionally last-writer-wins.
+_CONFIG_LOCK = threading.RLock()
+_SETTINGS_KEYS = (
+    "enabled", "mappings", "builtin_mappings", "approval_enabled", "approval_mappings",
+    "claude_code_defaults",
+)
+
+
 def normalize_routing_model_name(model_name) -> str | None:
+    """Keep legacy provider normalization for existing external callers."""
     if not isinstance(model_name, str):
         return None
-
     raw = model_name.strip()
     if not raw:
         return None
-
     normalized = "-".join(raw.lower().replace("_", "-").split())
     resolved = format_translation.resolve_copilot_model_name(normalized)
     return _normalize_model_name(resolved or normalized)
@@ -30,30 +48,36 @@ def model_provider_family(model_name: str | None) -> str | None:
     normalized = normalize_routing_model_name(model_name)
     if not normalized:
         return None
-    if normalized.startswith("claude-"):
-        return "claude"
-    if normalized.startswith("gpt-"):
-        return "codex"
-    if normalized.startswith("gemini-"):
-        return "gemini"
-    if normalized.startswith("grok-"):
-        return "grok"
+    for prefix, provider in (("claude-", "claude"), ("gpt-", "codex"),
+                             ("gemini-", "gemini"), ("grok-", "grok")):
+        if normalized.startswith(prefix):
+            return provider
     return None
 
 
 def _available_model_payloads() -> list[dict[str, str]]:
-    rows = []
-    for model_name in sorted(MODEL_PRICING):
-        provider = model_provider_family(model_name)
-        if provider is None:
-            continue
-        rows.append(
-            {
-                "model": model_name,
-                "provider": provider,
-            }
-        )
-    return rows
+    return [
+        {"model": model, "provider": "codex", "label": model.removesuffix("-excel")}
+        for model in excel_upstream.MODEL_IDS
+    ]
+
+
+def _alias_name(value: object) -> str | None:
+    """Aliases are literal names, not Copilot heuristics or pricing aliases."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip().lower()
+    if not name or len(name) > MAX_ROUTING_MODEL_NAME_LENGTH:
+        return None
+    if any(char in ",，" or unicodedata.category(char) in {"Cc", "Cf", "Cs"}
+           for char in name):
+        return None
+    return name
+
+
+def _entry_value(entry: dict, key: str, legacy_key: str):
+    # An explicitly invalid modern field must not be masked by the old field.
+    return entry[key] if key in entry else entry.get(legacy_key)
 
 
 @dataclass(frozen=True)
@@ -66,229 +90,290 @@ class ModelRoutingConfigService:
         self._config = config
         self._available_models = _available_model_payloads()
         self._known_models = {row["model"] for row in self._available_models}
+        self._target_aliases = {}
+        for model in self._known_models:
+            base = model.removesuffix("-excel")
+            for alias in (model, base, base + "-basispoints"):
+                self._target_aliases[alias] = model
+        # Not used for discovery or ordinary mapping targets. These independent
+        # legacy features must not change when the main routing UI is simplified.
+        self._legacy_models = {
+            name for name in MODEL_PRICING if model_provider_family(name) is not None
+        } | self._known_models
         self._claude_code_default_slots = ("opus_model", "sonnet_model", "haiku_model")
 
-    def config_payload(self) -> dict[str, object]:
-        current = self.load_settings()
+    def _config_payload(self, current: dict) -> dict[str, object]:
         return {
-            "enabled": current["enabled"],
-            "mappings": current["mappings"],
-            "approval_enabled": current["approval_enabled"],
-            "approval_mappings": current["approval_mappings"],
-            "claude_code_defaults": current["claude_code_defaults"],
-            "available_models": self._available_models,
-            "path": self._config.config_file,
+            **current,
+            "available_models": [dict(row) for row in self._available_models],
+            "path": os.fspath(self._config.config_file),
         }
 
+    def config_payload(self) -> dict[str, object]:
+        return self._config_payload(self.load_settings())
+
     def load_settings(self) -> dict[str, object]:
-        try:
-            with open(self._config.config_file, encoding="utf-8") as f:
-                payload = json.load(f)
-        except OSError:
-            return self.default_settings()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to parse {self._config.config_file}: {exc}",
-            ) from exc
-
-        if not isinstance(payload, dict):
-            raise HTTPException(
-                status_code=500,
-                detail=f"Invalid model remapping settings in {self._config.config_file}",
-            )
-
-        return self._normalize_settings_payload(payload)
+        with _CONFIG_LOCK:
+            try:
+                with open(self._config.config_file, encoding="utf-8") as stream:
+                    payload = json.load(stream)
+            except FileNotFoundError:
+                return self.default_settings()
+            except (OSError, ValueError):
+                settings = self.default_settings()
+                settings["builtin_mappings"] = []
+                settings["warnings"].append(
+                    "Model routing configuration could not be read; routing is inactive."
+                )
+                return settings
+            if not isinstance(payload, dict):
+                settings = self.default_settings()
+                settings["builtin_mappings"] = []
+                settings["warnings"].append(
+                    "Model routing configuration must be an object; routing is inactive."
+                )
+                return settings
+            return self._normalize_settings_payload(payload, loading=True)
 
     def save_settings(self, payload: dict) -> dict[str, object]:
-        normalized = self._normalize_settings_payload(payload)
-        os.makedirs(os.path.dirname(self._config.config_file) or TOKEN_DIR, exist_ok=True)
-        with open(self._config.config_file, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "enabled": normalized["enabled"],
-                    "mappings": normalized["mappings"],
-                    "approval_enabled": normalized["approval_enabled"],
-                    "approval_mappings": normalized["approval_mappings"],
-                    "claude_code_defaults": normalized["claude_code_defaults"],
-                },
-                f,
-                indent=2,
-            )
-            f.write("\n")
-        return self.config_payload()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Request body must be an object.")
+        with _CONFIG_LOCK:
+            merged = dict(payload)
+            # Partial UI saves preserve all omitted settings, including disabled
+            # custom rules and intentionally empty built-in lists from older saves.
+            if any(key not in merged for key in _SETTINGS_KEYS):
+                current = self.load_settings()
+                for key in _SETTINGS_KEYS:
+                    merged.setdefault(key, current[key])
+            normalized = self._normalize_settings_payload(merged)
+            destination = os.path.abspath(self._config.config_file)
+            directory = os.path.dirname(destination)
+            os.makedirs(directory, exist_ok=True)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=directory,
+                    prefix=".model-routing-", suffix=".tmp", delete=False,
+                ) as stream:
+                    temporary = stream.name
+                    json.dump({key: normalized[key] for key in _SETTINGS_KEYS}, stream,
+                              indent=2, ensure_ascii=True)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, destination)
+            finally:
+                if temporary is not None and os.path.exists(temporary):
+                    os.unlink(temporary)
+            # Return this save's snapshot, not another writer's subsequent save.
+            return self._config_payload(normalized)
 
-    def resolve_target_model(self, requested_model: str | None) -> str | None:
-        normalized_requested = normalize_routing_model_name(requested_model)
-        if not normalized_requested:
-            return None
-
-        settings = self.load_settings()
-        if not settings["enabled"]:
-            return None
-
-        for mapping in settings["mappings"]:
-            if mapping["source_model"] == normalized_requested:
+    @staticmethod
+    def _resolve_mapping(settings: dict, requested: str) -> str | None:
+        if settings["enabled"]:
+            for mapping in settings["mappings"]:
+                if requested in mapping["source_model"].split(","):
+                    return mapping["target_model"]
+        # The custom routing switch does not disable managed built-in aliases.
+        for mapping in settings["builtin_mappings"]:
+            if mapping["enabled"] and requested in mapping["source_model"].split(","):
                 return mapping["target_model"]
         return None
 
-    def resolve_compact_fallback_model(self, requested_model: str | None) -> str | None:
-        """Return the GPT model to use when a compact is requested against a
-        chat-backed target (Claude/Gemini/Grok). Returns None if no remap is
-        active for this model or if the resolved target is already a Codex
-        model. Falls back to DEFAULT_COMPACT_FALLBACK_MODEL when the mapping
-        entry has no explicit override.
+    def resolve_target_model(self, requested_model: str | None) -> str | None:
+        """Resolve explicit custom/built-in mappings only, without identity fallback."""
+        requested = _alias_name(requested_model)
+        if not requested:
+            return None
+        return self._resolve_mapping(self.load_settings(), requested)
+
+    def resolve_bps_model(self, requested_model: str | None) -> str | None:
+        """Resolve once: active custom, active built-in, then canonical membership.
+
+        Ingress must use this result rather than an is_excel_model fallback:
+        removed/disabled bare and basispoints aliases must not be resurrected.
+        Canonical IDs remain supported directly; no provider-prefix or implicit
+        bare/basispoints expansion is performed on incoming names.
         """
-        normalized_requested = normalize_routing_model_name(requested_model)
+        requested = _alias_name(requested_model)
+        if not requested:
+            return None
+        mapped = self._resolve_mapping(self.load_settings(), requested)
+        if mapped is not None:
+            return mapped
+        return requested if requested in self._known_models else None
+
+    def resolve_compact_fallback_model(self, requested_model: str | None) -> str | None:
+        """Keep the legacy hook; supported BPS targets need no compact fallback."""
+        normalized_requested = _alias_name(requested_model)
         if not normalized_requested:
             return None
-
         settings = self.load_settings()
         if not settings["enabled"]:
             return None
-
         for mapping in settings["mappings"]:
-            if mapping["source_model"] != normalized_requested:
+            if normalized_requested not in mapping["source_model"].split(","):
                 continue
             if mapping.get("target_provider") == "codex":
                 return None
-            override = mapping.get("compact_fallback_model")
-            fallback = override or DEFAULT_COMPACT_FALLBACK_MODEL
-            if model_provider_family(fallback) != "codex":
-                # Guard against a misconfigured non-GPT fallback — that would
-                # just reproduce the original context-overflow error.
-                return DEFAULT_COMPACT_FALLBACK_MODEL
-            return fallback
+            fallback = mapping.get("compact_fallback_model") or DEFAULT_COMPACT_FALLBACK_MODEL
+            return fallback if model_provider_family(fallback) == "codex" else DEFAULT_COMPACT_FALLBACK_MODEL
         return None
 
     def resolve_approval_target_model(self, requested_model: str | None) -> str | None:
-        normalized_requested = normalize_routing_model_name(requested_model)
+        normalized_requested = normalize_routing_model_name(_alias_name(requested_model))
         if not normalized_requested:
             return None
-
         settings = self.load_settings()
-        if not settings["approval_enabled"]:
-            return None
-
-        for mapping in settings["approval_mappings"]:
-            if mapping["source_model"] == normalized_requested:
-                return mapping["target_model"]
+        if settings["approval_enabled"]:
+            for mapping in settings["approval_mappings"]:
+                if normalized_requested in mapping["source_model"].split(","):
+                    return mapping["target_model"]
         return None
+
+    def _default_builtin_mappings(self) -> list[dict]:
+        return self._normalize_mapping_list([
+            {"source_model": f"{base},{base}-basispoints", "target_model": model}
+            for model in excel_upstream.MODEL_IDS
+            for base in (model.removesuffix("-excel"),)
+        ], label="Built-in mapping", builtin=True)
 
     def default_settings(self) -> dict[str, object]:
         return {
-            "enabled": False,
-            "mappings": [],
-            "approval_enabled": False,
-            "approval_mappings": [],
-            "claude_code_defaults": {
-                "opus_model": "",
-                "sonnet_model": "",
-                "haiku_model": "",
-            },
+            "enabled": False, "mappings": [],
+            "builtin_mappings": self._default_builtin_mappings(),
+            "approval_enabled": False, "approval_mappings": [],
+            "claude_code_defaults": {slot: "" for slot in self._claude_code_default_slots},
+            "warnings": [],
         }
 
-    def _normalize_settings_payload(self, payload: dict) -> dict[str, object]:
+    def _normalize_settings_payload(self, payload: dict, *, loading=False) -> dict[str, object]:
         if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Request body must be an object")
-
-        enabled = bool(payload.get("enabled", False))
-        mappings = self._normalize_mapping_list(payload.get("mappings", []), label="Mapping")
-
-        approval_enabled = bool(payload.get("approval_enabled", False))
-        approval_mappings = self._normalize_mapping_list(
-            payload.get("approval_mappings", []),
-            label="Approval mapping",
+            raise HTTPException(status_code=400, detail="Request body must be an object.")
+        warnings: list[str] = []
+        settings = {}
+        for key in ("enabled", "approval_enabled"):
+            value = payload.get(key, False)
+            if not isinstance(value, bool):
+                if not loading:
+                    raise HTTPException(status_code=400, detail=f'{key} must be a boolean.')
+                warnings.append(f"Invalid {key} flag; this routing feature is inactive.")
+                value = False
+            settings[key] = value
+        for key, label, legacy in (("mappings", "Mapping", False),
+                                   ("approval_mappings", "Approval mapping", True)):
+            settings[key] = self._normalize_mapping_list(
+                payload.get(key), label=label, legacy=legacy,
+                warnings=warnings if loading else None,
+            )
+        # Only absence seeds defaults: [] means intentional deletion, and invalid
+        # stored lists are warned about and inactive rather than resurrected.
+        settings["builtin_mappings"] = (
+            self._normalize_mapping_list(
+                payload["builtin_mappings"], label="Built-in mapping", builtin=True,
+                warnings=warnings if loading else None,
+            ) if "builtin_mappings" in payload else self._default_builtin_mappings()
         )
-        claude_code_defaults = self._normalize_claude_code_defaults(
-            payload.get("claude_code_defaults"),
+        settings["claude_code_defaults"] = self._normalize_claude_code_defaults(
+            payload.get("claude_code_defaults"), warnings=warnings if loading else None,
         )
+        settings["warnings"] = warnings
+        return settings
 
-        return {
-            "enabled": enabled,
-            "mappings": mappings,
-            "approval_enabled": approval_enabled,
-            "approval_mappings": approval_mappings,
-            "claude_code_defaults": claude_code_defaults,
-        }
+    def _target_model(self, value, *, legacy=False) -> str | None:
+        name = _alias_name(value)
+        if not name:
+            return None
+        if legacy:
+            normalized = normalize_routing_model_name(name)
+            if normalized in self._legacy_models:
+                return normalized
+        return self._target_aliases.get(name.removeprefix("openai/"))
 
-    def _normalize_mapping_list(self, raw_mappings, *, label: str) -> list[dict[str, str]]:
-        if raw_mappings is None:
+    def _normalize_mapping_list(self, raw_mappings, *, label: str, legacy=False, builtin=False,
+                                warnings: list[str] | None = None) -> list[dict]:
+        if raw_mappings is None and not builtin:
             raw_mappings = []
         if not isinstance(raw_mappings, list):
-            raise HTTPException(status_code=400, detail=f'"{label.lower()}s" must be a list.')
-
-        mappings: list[dict[str, str]] = []
+            if warnings is not None:
+                warnings.append(f"Ignored {label.lower()}s: expected a list.")
+                return []
+            raise HTTPException(status_code=400, detail=f'{label.lower()}s must be a list.')
+        mappings = []
         seen_sources: set[str] = set()
         for index, entry in enumerate(raw_mappings, start=1):
-            if not isinstance(entry, dict):
-                raise HTTPException(status_code=400, detail=f"{label} #{index} must be an object.")
-
-            source_model = normalize_routing_model_name(entry.get("source_model") or entry.get("source"))
-            target_model = normalize_routing_model_name(entry.get("target_model") or entry.get("target"))
-            if not source_model:
-                raise HTTPException(status_code=400, detail=f"{label} #{index} must include a valid source_model.")
-            if not target_model:
-                raise HTTPException(status_code=400, detail=f"{label} #{index} must include a valid target_model.")
-            if source_model not in self._known_models:
-                raise HTTPException(status_code=400, detail=f"{label} #{index} source model is unsupported: {source_model}")
-            if target_model not in self._known_models:
-                raise HTTPException(status_code=400, detail=f"{label} #{index} target model is unsupported: {target_model}")
-            if source_model in seen_sources:
-                raise HTTPException(status_code=400, detail=f"Duplicate {label.lower()} source_model: {source_model}")
-
-            seen_sources.add(source_model)
-            normalized_entry: dict[str, str] = {
-                "source_model": source_model,
-                "source_provider": model_provider_family(source_model),
-                "target_model": target_model,
-                "target_provider": model_provider_family(target_model),
-            }
-            raw_compact_fallback = entry.get("compact_fallback_model") or entry.get("compact_fallback")
-            if raw_compact_fallback is not None and str(raw_compact_fallback).strip():
-                compact_fallback = normalize_routing_model_name(raw_compact_fallback)
-                if not compact_fallback:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"{label} #{index} compact_fallback_model is not a recognized model.",
+            try:
+                if not isinstance(entry, dict):
+                    raise ValueError("must be an object")
+                source = _entry_value(entry, "source_model", "source")
+                if not isinstance(source, str):
+                    raise ValueError("source_model must be a comma-separated string")
+                aliases = [_alias_name(part) for part in source.replace("，", ",").split(",")]
+                if not all(aliases):
+                    raise ValueError(
+                        f"source_model aliases must be nonempty, at most {MAX_ROUTING_MODEL_NAME_LENGTH} characters, and contain no control characters"
                     )
-                if compact_fallback not in self._known_models:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"{label} #{index} compact_fallback_model is unsupported: {compact_fallback}",
-                    )
-                if model_provider_family(compact_fallback) != "codex":
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"{label} #{index} compact_fallback_model must be a GPT model (got {compact_fallback}).",
-                    )
-                normalized_entry["compact_fallback_model"] = compact_fallback
-            mappings.append(normalized_entry)
+                if legacy:
+                    aliases = [normalize_routing_model_name(alias) for alias in aliases]
+                    if not all(aliases):
+                        raise ValueError("source_model must include valid aliases")
+                if len(set(aliases)) != len(aliases) or seen_sources.intersection(aliases):
+                    raise ValueError("duplicate source_model alias after normalization")
+                target = self._target_model(
+                    _entry_value(entry, "target_model", "target"), legacy=legacy,
+                )
+                if not target:
+                    raise ValueError("target_model is invalid or unsupported")
+                providers = {model_provider_family(alias) for alias in aliases}
+                normalized = {
+                    "source_model": ",".join(aliases),
+                    "source_provider": next(iter(providers)) if len(providers) == 1 else None,
+                    "target_model": target,
+                    "target_provider": model_provider_family(target),
+                }
+                if builtin:
+                    enabled = entry.get("enabled", True)
+                    if not isinstance(enabled, bool):
+                        raise ValueError("enabled must be a boolean")
+                    normalized["enabled"] = enabled
+                raw_fallback = _entry_value(entry, "compact_fallback_model", "compact_fallback")
+                if raw_fallback is not None and not (isinstance(raw_fallback, str) and not raw_fallback.strip()):
+                    fallback = self._target_model(raw_fallback, legacy=True)
+                    if not fallback or model_provider_family(fallback) != "codex":
+                        raise ValueError("compact_fallback_model must be a supported GPT model")
+                    normalized["compact_fallback_model"] = fallback
+                seen_sources.update(aliases)
+                mappings.append(normalized)
+            except ValueError as exc:
+                # Only static validation messages are exposed: never echo stored
+                # aliases/targets, arbitrary HTML, file contents, or credentials.
+                message = f"{label} #{index}: {exc}."
+                if warnings is None:
+                    raise HTTPException(status_code=400, detail=message) from exc
+                warnings.append(f"Ignored inactive rule. {message}")
         return mappings
 
-    def _normalize_claude_code_defaults(self, raw_defaults: object) -> dict[str, str]:
+    def _normalize_claude_code_defaults(self, raw_defaults: object, *,
+                                         warnings: list[str] | None = None) -> dict[str, str]:
         if raw_defaults is None:
             raw_defaults = {}
         if not isinstance(raw_defaults, dict):
-            raise HTTPException(status_code=400, detail='"claude_code_defaults" must be an object.')
-
-        normalized_defaults: dict[str, str] = {}
-        for slot_key in self._claude_code_default_slots:
-            raw_value = raw_defaults.get(slot_key)
-            if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
-                normalized_defaults[slot_key] = ""
+            if warnings is None:
+                raise HTTPException(status_code=400, detail='claude_code_defaults must be an object.')
+            warnings.append("Ignored obsolete claude_code_defaults: expected an object.")
+            raw_defaults = {}
+        defaults = {}
+        for slot in self._claude_code_default_slots:
+            raw = raw_defaults.get(slot)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                defaults[slot] = ""
                 continue
-            model_name = normalize_routing_model_name(raw_value)
-            if not model_name:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f'claude_code_defaults.{slot_key} must be a recognized model.',
-                )
-            if model_name not in self._known_models:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"claude_code_defaults.{slot_key} is unsupported: {model_name}",
-                )
-            normalized_defaults[slot_key] = model_name
-
-        return normalized_defaults
+            model = self._target_model(raw, legacy=True)
+            if not model:
+                message = f"claude_code_defaults.{slot} is invalid or unsupported."
+                if warnings is None:
+                    raise HTTPException(status_code=400, detail=message)
+                warnings.append(f"Ignored obsolete default. {message}")
+            defaults[slot] = model or ""
+        return defaults

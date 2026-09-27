@@ -274,6 +274,8 @@ def load_windows_excel_session(webview_root: Path | None = None) -> dict[str, st
 
 
 def refresh_macos_excel_session(session_store, *, force: bool = False, website_data: Path | None = None) -> dict[str, object]:
+    if session_store.status().get("source") == "oauth":
+        return session_store.status()
     if sys.platform != "darwin":
         return session_store.status()
     status = session_store.status()
@@ -291,6 +293,8 @@ def refresh_macos_excel_session(session_store, *, force: bool = False, website_d
 
 
 def refresh_windows_excel_session(session_store, *, force: bool = False, webview_root: Path | None = None) -> dict[str, object]:
+    if session_store.status().get("source") == "oauth":
+        return session_store.status()
     if sys.platform != "win32":
         return session_store.status()
     status = session_store.status()

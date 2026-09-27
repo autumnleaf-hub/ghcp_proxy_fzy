@@ -45,7 +45,10 @@ EXCEL_IMAGE_FILE_ID_CACHE_FILE = os.path.join(TOKEN_DIR, "excel-image-file-ids.j
 PROXY_PID_FILE = os.path.join(TOKEN_DIR, "ghcp-proxy.pid")
 PROXY_STDOUT_LOG_FILE = os.path.join(TOKEN_DIR, "ghcp-proxy.stdout.log")
 PROXY_STDERR_LOG_FILE = os.path.join(TOKEN_DIR, "ghcp-proxy.stderr.log")
-PROXY_BASE_URL    = "http://127.0.0.1:8000"
+PROXY_PORT = int(os.environ.get("GHCP_PORT", "8001"))
+if not 1 <= PROXY_PORT <= 65535:
+    raise ValueError("GHCP_PORT must be between 1 and 65535")
+PROXY_BASE_URL = f"http://127.0.0.1:{PROXY_PORT}"
 CODEX_PROXY_BASE_URL = f"{PROXY_BASE_URL}/v1"
 DASHBOARD_BASE_URL = PROXY_BASE_URL
 DASHBOARD_FILE    = os.path.join(os.path.dirname(__file__), "dashboard.html")
@@ -55,7 +58,7 @@ SQLITE_CACHE_FILE = os.path.join(
 CODEX_CONFIG_DIR    = os.path.expanduser("~/.codex")
 CODEX_PRIMARY_CONFIG_FILE = os.path.join(CODEX_CONFIG_DIR, "config.toml")
 CODEX_MANAGED_CONFIG_FILE = os.path.join(CODEX_CONFIG_DIR, "managed_config.toml")
-CODEX_PROXY_MODEL_CATALOG_FILE = os.path.join(CODEX_CONFIG_DIR, "ghcp-proxy-models.json")
+CODEX_PROXY_MODEL_CATALOG_FILE = os.path.join(CODEX_CONFIG_DIR, "ghcp-proxy-fzy-models.json")
 # Codex presents the usable window at 95% of this raw prompt limit; 272k
 # therefore reports as the expected ~258k before auto compaction.
 CODEX_PROXY_MODEL_CONTEXT_WINDOW = 272000
@@ -75,13 +78,13 @@ DEFAULT_COMPACT_FALLBACK_MODEL = "gpt-5.4"
 # Claude Code commonly emits ``thinking: {"type":"adaptive"}`` regardless of
 # the user's picker choice, so translation falls back to this configured level.
 CLAUDE_DEFAULT_REASONING_EFFORT = "medium"
-CODEX_PROXY_CONFIG = """\
+CODEX_PROXY_CONFIG = f"""\
 model_provider = "custom"
 approvals_reviewer = "user"
 
 [model_providers.custom]
 name = "OpenAI"
-base_url = "http://127.0.0.1:8000/v1"
+base_url = "{CODEX_PROXY_BASE_URL}"
 wire_api = "responses"
 """
 CLAUDE_PROXY_SETTINGS = {
@@ -558,6 +561,16 @@ MODEL_PRICING = {
     },
 }
 
+# Reuse the existing base rates; Excel usage is accounted in OpenAI Credits.
+for _excel_base_model in ("gpt-6-sol", "gpt-6-luna"):
+    MODEL_PRICING[f"{_excel_base_model}-excel"] = {
+        **MODEL_PRICING[_excel_base_model],
+        "provider": "OpenAI Excel",
+        "credit_unit_usd": 0.04,
+    }
+del _excel_base_model
+
+
 MODEL_PRICING_ALIASES = {
     "anthropic/claude-haiku-4.5": "claude-haiku-4-5",
     "anthropic/claude-opus-4.5": "claude-opus-4.6",
@@ -576,7 +589,9 @@ MODEL_PRICING_ALIASES = {
     "gpt-6 astra": "gpt-6-astra",
     "gpt-6 astra excel": "gpt-6-astra-excel",
     "gpt-6 sol": "gpt-6-sol",
+    "gpt-6 sol excel": "gpt-6-sol-excel",
     "gpt-6 luna": "gpt-6-luna",
+    "gpt-6 luna excel": "gpt-6-luna-excel",
     "gpt-5.6 luna": "gpt-5.6-luna",
     "gpt-5.6 luna excel": "gpt-5.6-luna-excel",
     "gpt-5.6 sol": "gpt-5.6-sol",

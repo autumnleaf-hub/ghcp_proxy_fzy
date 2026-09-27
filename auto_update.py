@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import subprocess
+import tempfile
 import sys
 import time
 from contextlib import suppress
@@ -27,6 +28,7 @@ AUTO_UPDATE_STATE_FILE = os.path.join(TOKEN_DIR, "auto-update.json")
 AUTO_UPDATE_SETTINGS_FILE = os.path.join(TOKEN_DIR, "auto-update-settings.json")
 AUTO_UPDATE_LOCK_FILE = os.path.join(TOKEN_DIR, "auto-update.lock")
 AUTO_UPDATE_MODES = {"user", "developer"}
+_AUTO_UPDATE_SETTINGS_LOCK = RLock()
 
 
 @dataclass(frozen=True)
@@ -127,9 +129,25 @@ class AutoUpdateManager:
         self.clock = clock
 
     def enabled(self) -> bool:
-        # Default on for normal users, but easy to opt out for packaged,
-        # air-gapped, or heavily customized installs.
-        return _env_flag_default("GHCP_AUTO_UPDATE", default=True)
+        saved = self._load_settings().get("enabled", True)
+        default = saved if type(saved) is bool else True
+        return _env_flag_default("GHCP_AUTO_UPDATE", default=default)
+
+    def enabled_source(self) -> str:
+        if str(os.environ.get("GHCP_AUTO_UPDATE", "")).strip():
+            return "env"
+        return "settings" if type(self._load_settings().get("enabled")) is bool else "default"
+
+    def set_enabled(self, enabled: bool) -> dict[str, object]:
+        if type(enabled) is not bool:
+            raise ValueError("自动更新开关必须为布尔值。")
+        if self.enabled_source() == "env":
+            raise ValueError("自动更新由环境变量 GHCP_AUTO_UPDATE 控制，请先移除该覆盖。")
+        with _AUTO_UPDATE_SETTINGS_LOCK:
+            settings = self._load_settings()
+            settings["enabled"] = enabled
+            self._save_settings(settings)
+        return self.settings_payload()
 
     def check_interval_seconds(self) -> float:
         return max(0.0, _env_float("GHCP_AUTO_UPDATE_INTERVAL_SECONDS", default=DEFAULT_CHECK_INTERVAL_SECONDS))
@@ -158,13 +176,16 @@ class AutoUpdateManager:
         normalized = str(mode or "").strip().lower()
         if normalized not in AUTO_UPDATE_MODES:
             raise ValueError("auto-update mode must be 'user' or 'developer'")
-        settings = self._load_settings()
-        settings["mode"] = normalized
-        self._save_settings(settings)
+        with _AUTO_UPDATE_SETTINGS_LOCK:
+            settings = self._load_settings()
+            settings["mode"] = normalized
+            self._save_settings(settings)
         return self.settings_payload()
 
     def settings_payload(self) -> dict[str, object]:
         return {
+            "enabled": self.enabled(),
+            "enabled_source": self.enabled_source(),
             "mode": self.mode(),
             "mode_source": self.mode_source(),
             "settings_file": self.settings_file,
@@ -696,12 +717,19 @@ class AutoUpdateManager:
         return payload if isinstance(payload, dict) else {}
 
     def _save_settings(self, settings: dict[str, object]) -> None:
-        os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
-        temp_path = f"{self.settings_file}.tmp"
-        with open(temp_path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(settings, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.replace(temp_path, self.settings_file)
+        parent = os.path.dirname(os.path.abspath(self.settings_file))
+        os.makedirs(parent, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".auto-update-settings-", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2, sort_keys=True)
+                f.write(chr(10))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, self.settings_file)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
 
     def _save_state(self, result: dict[str, object], *, now: float) -> None:
         payload = {
@@ -782,7 +810,8 @@ class AutoUpdateRuntimeController:
             if self._last_notice_epoch and now - self._last_notice_epoch < self.notice_interval_seconds:
                 return ""
             self._last_notice_epoch = now
-        return "By the way, an update is available for GHCP Proxy. Visit http://localhost:8000 to update the proxy from the dashboard."
+        from constants import PROXY_BASE_URL
+        return f"By the way, an update is available for GHCP Proxy. Visit {PROXY_BASE_URL} to update the proxy from the dashboard."
 
     def note_request_started(self, request_id: str) -> None:
         request_id = str(request_id or "").strip()

@@ -6,6 +6,8 @@ import os
 import shutil
 import sys
 
+from app_paths import APP_DIR_NAME
+
 from constants import (
     ACCESS_TOKEN_FILE,
     API_KEY_FILE,
@@ -47,6 +49,9 @@ def _copy_file_if_missing(source: str, destination: str) -> bool:
 def migrate_legacy_runtime_files() -> list[tuple[str, str]]:
     """Copy legacy files forward without deleting or overwriting user data."""
 
+    # Side-by-side forks must not import the original instance's activation state.
+    if APP_DIR_NAME != "ghcp_proxy":
+        return []
     if not os.path.isdir(LEGACY_TOKEN_DIR) or _same_path(LEGACY_TOKEN_DIR, TOKEN_DIR):
         return []
 

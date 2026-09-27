@@ -38,6 +38,7 @@ import util
 from constants import TOKEN_DIR
 
 try:
+    raise ImportError("Copilot SDK is disabled in this BPS-only build")
     from copilot import CopilotClient, Tool
     from copilot.copilot_request_handler import CopilotRequestHandler, CopilotWebSocketForwarder
     from copilot.rpc import ExternalToolTextResultForLlm, HandlePendingToolCallRequest
@@ -321,13 +322,11 @@ async def _delete_owned_session(session_id: str) -> None:
 
 
 def responses_upstream() -> str:
-    """Return the selected Codex Responses upstream (SDK by default in v2)."""
-    value = os.getenv(RESPONSES_UPSTREAM_ENV, SDK_UPSTREAM).strip().lower()
-    return REST_UPSTREAM if value == REST_UPSTREAM else SDK_UPSTREAM
+    return "disabled"
 
 
 def enabled() -> bool:
-    return responses_upstream() == SDK_UPSTREAM
+    return False
 
 
 def is_compaction_request(body: dict | None) -> bool:
@@ -850,43 +849,7 @@ def resolve_tool_continuation(value: Any) -> tuple[str, list[PendingToolResult]]
 
 
 async def _get_client():
-    global _client, _client_lock, _client_pruned, _client_token
-    if _SDK_IMPORT_ERROR is not None or CopilotClient is None:
-        raise RuntimeError(
-            "The official Copilot SDK is not installed. Run: pip install github-copilot-sdk"
-        ) from _SDK_IMPORT_ERROR
-    if _client_lock is None:
-        _client_lock = asyncio.Lock()
-    token = auth.load_access_token()
-    async with _client_lock:
-        if _client is not None and token == _client_token:
-            return _client
-        if _client is not None:
-            # Retained idle sessions belong to this runtime connection. Never
-            # reuse their Python wrappers after replacing the authenticated client.
-            await _evict_all_live_sessions()
-            await _close_websocket_pool()
-            await _client.stop()
-        # The SDK's first-run runtime downloader uses urllib rather than httpx.
-        # Framework builds of Python on macOS commonly lack a usable system CA
-        # chain, while certifi is already an httpx dependency.
-        os.environ.setdefault("SSL_CERT_FILE", certifi.where())
-        os.makedirs(_SDK_STATE_DIR, exist_ok=True)
-        _client = CopilotClient(
-            github_token=token,
-            use_logged_in_user=token is None,
-            working_directory=os.getcwd(),
-            base_directory=_SDK_STATE_DIR,
-            log_level=os.getenv("GHCP_SDK_LOG_LEVEL", "error"),
-            mode="empty",
-            **_request_handler_options(),
-        )
-        await _client.start()
-        _client_token = token
-        if not _client_pruned:
-            await _prune_abandoned_sessions(_client)
-            _client_pruned = True
-        return _client
+    raise RuntimeError("Copilot SDK is disabled in this BPS-only build.")
 
 
 def _reasoning_effort(body: dict) -> str | None:
@@ -3617,133 +3580,15 @@ async def handle_responses(
     finish_usage_callback: Any = None,
     mark_first_output_callback: Any = None,
 ) -> Response:
-    if body.get("input") is None:
-        return format_translation.openai_error_response(400, "input is required")
-    registration = build_tool_registration(body)
-    session_diagnostics: dict = {}
-    if plan is not None and isinstance(getattr(plan, "trace_context", None), dict):
-        plan.trace_context["copilot_sdk_session"] = session_diagnostics
-    try:
-        session, dispatch = await _open_session(body, registration, diagnostics=session_diagnostics)
-    except Exception as exc:
-        if finish_usage_callback is not None and plan is not None:
-            try:
-                finish_usage_callback(plan, 502, response_text=str(exc))
-            except Exception:
-                pass
-        return format_translation.openai_error_response(502, f"Copilot SDK: {exc}")
-
-    if plan is not None and getattr(plan, "usage_event", None) is not None:
-        if not plan.usage_event.get("session_id"):
-            plan.usage_event["session_id"] = session.session_id
-            plan.usage_event["session_id_origin"] = "copilot_sdk"
-
-    entry = _live_sessions.get(session.session_id)
-    if entry is not None and entry.session is session:
-        entry.summary_delivery = (
-            _requested_summary_delivery(body) if body.get("stream") and not is_compact else None
-        )
-        # A summary turn must not call tools, but keeps them declared so its
-        # prompt matches the session's cached prefix (_UpstreamRequestHandler).
-        entry.tool_choice = "none" if is_compact else None
-        if entry.background_calls:
-            session_diagnostics["background_model_calls"] = entry.background_calls
-            entry.background_calls = []
-        entry.diagnostics = session_diagnostics
-
-    if bool(body.get("stream")):
-        return StreamingResponse(
-            _stream_turn(
-                request,
-                body,
-                session,
-                dispatch,
-                registration,
-                plan=plan,
-                is_compact=is_compact,
-                finish_usage_callback=finish_usage_callback,
-                mark_first_output_callback=mark_first_output_callback,
-                diagnostics=session_diagnostics,
-            ),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
-    response_id = _new_id("resp")
-    succeeded = False
-    outcome = None
-    try:
-        outcome = await _wait_for_outcome(session, dispatch, registration)
-        succeeded = True
-        if is_compact:
-            payload = to_compaction_payload(body, session.session_id, outcome, response_id)
-        else:
-            payload = _response_payload(body, session.session_id, outcome, response_id)
-        if finish_usage_callback is not None and plan is not None:
-            try:
-                finish_usage_callback(
-                    plan,
-                    200,
-                    response_payload=payload,
-                    response_text=outcome.text,
-                    reasoning_text=outcome.reasoning,
-                    usage=outcome.usage,
-                )
-            except Exception:
-                pass
-        return JSONResponse(payload)
-    except ValueError as exc:
-        if finish_usage_callback is not None and plan is not None:
-            try:
-                finish_usage_callback(plan, 400, response_text=str(exc))
-            except Exception:
-                pass
-        return format_translation.openai_error_response(400, str(exc))
-    except Exception as exc:
-        session_diagnostics["error"] = str(exc)[:500]
-        if finish_usage_callback is not None and plan is not None:
-            try:
-                finish_usage_callback(plan, 502, response_text=str(exc))
-            except Exception:
-                pass
-        return format_translation.openai_error_response(502, f"Copilot SDK: {exc}")
-    finally:
-        await _release_session(session, outcome, completed=succeeded)
-        _remember_session(session.session_id)
-        _commit_alias_watermark(session.session_id, success=succeeded)
+    return format_translation.openai_error_response(501, "Copilot SDK 已禁用，请使用 BPS Responses。")
 
 
 async def models_response() -> Response:
-    try:
-        client = await _get_client()
-        models = await client.list_models()
-    except Exception as exc:
-        return format_translation.openai_error_response(502, f"Copilot SDK: {exc}")
-    data = [
-        {
-            "id": model.id,
-            "object": "model",
-            "created": 0,
-            "owned_by": "github-copilot",
-        }
-        for model in models
-    ]
-    return JSONResponse(
-        excel_upstream.merge_local_models_payload({"object": "list", "data": data})
-    )
+    return JSONResponse(content=excel_upstream.merge_local_models_payload({}))
 
 
 async def shutdown() -> None:
-    """Stop the managed Copilot runtime during application shutdown."""
-    global _client, _client_pruned, _client_token
-    client = _client
-    _client = None
-    _client_token = None
-    _client_pruned = False
-    await _evict_all_live_sessions()
-    await _close_websocket_pool()
-    if client is not None:
-        await client.stop()
+    return None  # No Copilot runtime exists in BPS-only mode.
 
 
 # ---------------------------------------------------------------------------
@@ -3931,75 +3776,7 @@ def _parse_session_state_file(session_id: str, events_path: str) -> list[dict]:
 
 
 def scan_session_state(record_callback: Callable[[dict], None]) -> int:
-    """Scan session-state directory and emit usage events for completed SDK session turns."""
-    if not os.path.isdir(_SESSION_STATE_DIR):
-        return 0
-    cursor = _read_cursor()
-    ingested_count = 0
-    dirty = False
-
-    try:
-        entries = sorted(os.listdir(_SESSION_STATE_DIR))
-    except OSError:
-        return 0
-
-    for session_id in entries:
-        session_dir = os.path.join(_SESSION_STATE_DIR, session_id)
-        if not os.path.isdir(session_dir):
-            continue
-        # Requests handled by this proxy already report their usage through
-        # ``finish_usage_callback``.  The SDK also persists the same
-        # session.shutdown record, so ingesting an owned session here would
-        # count every turn twice (once under the HTTP request id and once
-        # under copilot-sdk:<session>:<interaction>).  The scanner is for SDK
-        # sessions created outside the request lifecycle, such as sessions
-        # left behind by a crashed/older proxy process.
-        if _owns_session(session_id):
-            continue
-        events_path = os.path.join(session_dir, "events.jsonl")
-        if not os.path.isfile(events_path):
-            continue
-
-        try:
-            mtime = os.path.getmtime(events_path)
-            size = os.path.getsize(events_path)
-        except OSError:
-            continue
-
-        prior = cursor.get(session_id)
-        prior_turns = 0
-        if isinstance(prior, dict):
-            if prior.get("size") == size and prior.get("mtime") == mtime:
-                continue
-            prior_turns = int(prior.get("ingested_turns", 0) or 0)
-
-        turn_events = _parse_session_state_file(session_id, events_path)
-        if not turn_events:
-            continue
-
-        new_turns = turn_events[prior_turns:]
-        for event in new_turns:
-            try:
-                record_callback(event)
-                ingested_count += 1
-            except Exception as exc:
-                print(f"copilot_sdk_upstream: failed to record turn {event.get('request_id')}: {exc}", flush=True)
-
-        cursor[session_id] = {
-            "size": size,
-            "mtime": mtime,
-            "ingested_turns": len(turn_events),
-            "updated_at": time.time(),
-        }
-        dirty = True
-
-    if dirty:
-        try:
-            _write_cursor(cursor)
-        except OSError:
-            pass
-
-    return ingested_count
+    return None  # Copilot ingestion is disabled.
 
 
 def start_background_scanner(
@@ -4007,18 +3784,7 @@ def start_background_scanner(
     *,
     interval_seconds: float = 10.0,
 ) -> threading.Thread:
-    """Start background thread scanning Copilot SDK session state."""
-    def _run():
-        while True:
-            try:
-                scan_session_state(record_callback)
-            except Exception as exc:
-                print(f"copilot_sdk_upstream: background scanner error: {exc}", flush=True)
-            time.sleep(interval_seconds)
-
-    thread = threading.Thread(target=_run, name="CopilotSdkSessionScanner", daemon=True)
-    thread.start()
-    return thread
+    return None  # Permanently disabled; no thread or session-state reads.
 
 
 __all__ = [

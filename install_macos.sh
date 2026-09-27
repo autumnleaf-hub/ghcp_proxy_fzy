@@ -49,7 +49,7 @@ Next steps:
   2. Start the proxy:
      python "${SCRIPT_DIR}/proxy.py"
   3. Open the dashboard:
-     http://localhost:8000/
+     http://localhost:8001/
 
 Notes:
   - Node.js and npx were detected successfully.

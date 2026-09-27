@@ -56,48 +56,23 @@ def _gh_headers(access_token: str = None) -> dict:
 
 
 def load_access_token() -> str | None:
-    try:
-        with open(ACCESS_TOKEN_FILE, encoding="utf-8") as f:
-            tok = f.read().strip()
-        return tok or None
-    except OSError:
-        return None
+    return None
 
 
 def _save_access_token(token: str):
-    os.makedirs(TOKEN_DIR, exist_ok=True)
-    with open(ACCESS_TOKEN_FILE, "w") as f:
-        f.write(token)
+    raise RuntimeError("Copilot is disabled in this BPS-only build.")
 
 
 def load_api_key() -> str | None:
-    try:
-        with open(API_KEY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if data["expires_at"] > datetime.now().timestamp():
-            return data["token"]
-    except Exception:
-        pass
     return None
 
 
 def load_api_key_payload() -> dict:
-    try:
-        with open(API_KEY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    return {}
 
 
 def get_api_base() -> str:
-    """Use the endpoint embedded in api-key.json if present, else default."""
-    try:
-        with open(API_KEY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("endpoints", {}).get("api") or GITHUB_COPILOT_API_BASE
-    except Exception:
-        return GITHUB_COPILOT_API_BASE
+    raise RuntimeError("Copilot is disabled in this BPS-only build.")
 
 
 def _utc_timestamp() -> float:
@@ -131,90 +106,15 @@ def _poll_for_access_token(
     expires_in: int,
     interactive: bool = False,
 ) -> str:
-    if not isinstance(device_code, str) or not device_code:
-        raise RuntimeError("Device flow failed — missing device code.")
-
-    max_attempts = max(12, max(1, expires_in) // max(1, interval))
-
-    with httpx.Client() as c:
-        for attempt in range(max_attempts):
-            time.sleep(interval)
-            r = c.post(
-                GITHUB_ACCESS_TOKEN_URL,
-                headers=_gh_headers(),
-                json={
-                    "client_id": GITHUB_CLIENT_ID,
-                    "device_code": device_code,
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                },
-            )
-            d = r.json()
-
-            if "access_token" in d:
-                _save_access_token(d["access_token"])
-                return d["access_token"]
-
-            error = d.get("error", "")
-            if error == "authorization_pending":
-                if interactive:
-                    dots = "." * ((attempt % 3) + 1)
-                    print(f"  Waiting{dots}", end="\r", flush=True)
-                continue
-            elif error == "slow_down":
-                interval += 5
-                continue
-            elif error in ("expired_token", "access_denied"):
-                if interactive:
-                    print(f"\n  Authorization failed: {error}", flush=True)
-                break
-            else:
-                if interactive:
-                    print(f"\n  Unexpected response: {d}", flush=True)
-                break
-
-    raise RuntimeError("Device flow failed — could not obtain access token.")
+    raise RuntimeError("Copilot is disabled in this BPS-only build.")
 
 
 def _device_flow() -> str:
-    """
-    Interactive GitHub OAuth device flow.
-    Prints the verification URL and code to the terminal, then polls until
-    the user authorizes (or times out after ~60 seconds).
-    Returns the GitHub OAuth access token.
-    """
-    info = _device_flow_info()
-
-    print("", flush=True)
-    print("─" * 60, flush=True)
-    print("  GitHub Copilot — Authorization Required", flush=True)
-    print("─" * 60, flush=True)
-    print(f"  1. Open:  {info['verification_uri']}", flush=True)
-    print(f"  2. Enter: {info['user_code']}", flush=True)
-    print("─" * 60, flush=True)
-    print("  Waiting for authorization...", flush=True)
-
-    access_token = _poll_for_access_token(
-        info["device_code"],
-        interval=int(info.get("interval", 5) or 5),
-        expires_in=int(info.get("expires_in", 60) or 60),
-        interactive=True,
-    )
-    print("  Authorized successfully.", flush=True)
-    print("-" * 60, flush=True)
-    print("", flush=True)
-    return access_token
+    raise RuntimeError("Copilot is disabled in this BPS-only build.")
 
 
 def _refresh_api_key(access_token: str) -> str:
-    """Exchange OAuth access token for a short-lived GHCP API key (~30 min TTL)."""
-    with httpx.Client() as c:
-        r = c.get(GITHUB_API_KEY_URL, headers=_gh_headers(access_token))
-        r.raise_for_status()
-        data = r.json()
-    os.makedirs(TOKEN_DIR, exist_ok=True)
-    with open(API_KEY_FILE, "w") as f:
-        json.dump(data, f)
-    return data["token"]
+    raise RuntimeError("Copilot is disabled in this BPS-only build.")
 
 
 def _authenticated_snapshot(*, message: str | None = None, warning: str | None = None) -> dict:
@@ -293,8 +193,8 @@ def _flow_snapshot_unlocked() -> dict:
 
 
 def auth_status() -> dict:
-    with _AUTH_FLOW_LOCK:
-        return _flow_snapshot_unlocked()
+    return {"state": "disabled", "status": "disabled", "authenticated": False,
+            "enabled": False, "message": "Copilot 已禁用，请使用 ChatGPT / BPS 凭证。"}
 
 
 def _complete_browser_auth_flow(
@@ -304,149 +204,11 @@ def _complete_browser_auth_flow(
     interval: int,
     expires_in: int,
 ):
-    try:
-        access_token = _poll_for_access_token(
-            device_code,
-            interval=interval,
-            expires_in=expires_in,
-        )
-        warning = ""
-        # The v2 Codex path passes the GitHub OAuth token to the official SDK;
-        # it neither needs nor should eagerly exchange it through Copilot's
-        # private REST token endpoint. Legacy REST/Claude routes refresh lazily
-        # through get_api_key() when they are actually used.
-        if os.getenv("GHCP_RESPONSES_UPSTREAM", "sdk").strip().lower() == "rest":
-            try:
-                _refresh_api_key(access_token)
-            except Exception as exc:
-                warning = f"Authorized, but the API key refresh failed: {exc}"
-
-        with _AUTH_FLOW_LOCK:
-            if _AUTH_FLOW_STATE.get("flow_id") != flow_id:
-                return
-            _AUTH_FLOW_STATE.update(
-                {
-                    "state": "authenticated",
-                    "flow_id": None,
-                    "started_at": None,
-                    "expires_at": None,
-                    "poll_interval_seconds": None,
-                    "verification_uri": None,
-                    "verification_uri_complete": None,
-                    "user_code": None,
-                    "error": "",
-                    "warning": warning,
-                    "message": "GitHub authorization completed.",
-                }
-            )
-    except Exception as exc:
-        with _AUTH_FLOW_LOCK:
-            if _AUTH_FLOW_STATE.get("flow_id") != flow_id:
-                return
-            _AUTH_FLOW_STATE.update(
-                {
-                    "state": "error",
-                    "flow_id": None,
-                    "verification_uri": None,
-                    "verification_uri_complete": None,
-                    "user_code": None,
-                    "started_at": None,
-                    "expires_at": None,
-                    "poll_interval_seconds": None,
-                    "error": str(exc),
-                    "warning": "",
-                    "message": "GitHub authorization did not complete.",
-                }
-            )
+    raise RuntimeError("Copilot is disabled in this BPS-only build.")
 
 
 def begin_device_flow() -> dict:
-    with _AUTH_FLOW_LOCK:
-        existing = _flow_snapshot_unlocked()
-        if existing["authenticated"] or existing["state"] in {"starting", "pending"}:
-            return existing
-        _AUTH_FLOW_STATE.update(
-            {
-                "state": "starting",
-                "flow_id": None,
-                "started_at": _utc_timestamp(),
-                "expires_at": None,
-                "poll_interval_seconds": None,
-                "verification_uri": None,
-                "verification_uri_complete": None,
-                "user_code": None,
-                "error": "",
-                "warning": "",
-                "message": "Requesting GitHub device code...",
-            }
-        )
-
-    try:
-        info = _device_flow_info()
-        flow_id = f"flow-{int(time.time() * 1000)}"
-        started_at = _utc_timestamp()
-        interval = int(info.get("interval", 5) or 5)
-        expires_in = int(info.get("expires_in", 60) or 60)
-        expires_at = started_at + max(1, expires_in)
-        verification_uri = info.get("verification_uri")
-        verification_uri_complete = info.get("verification_uri_complete")
-        user_code = info.get("user_code")
-        device_code = info.get("device_code")
-        if not isinstance(verification_uri, str) or not verification_uri:
-            raise RuntimeError("GitHub device flow did not return a verification URL.")
-        if not isinstance(user_code, str) or not user_code:
-            raise RuntimeError("GitHub device flow did not return a user code.")
-        if not isinstance(device_code, str) or not device_code:
-            raise RuntimeError("GitHub device flow did not return a device code.")
-    except Exception as exc:
-        with _AUTH_FLOW_LOCK:
-            _AUTH_FLOW_STATE.update(
-                {
-                    "state": "error",
-                    "flow_id": None,
-                    "started_at": None,
-                    "expires_at": None,
-                    "poll_interval_seconds": None,
-                    "verification_uri": None,
-                    "verification_uri_complete": None,
-                    "user_code": None,
-                    "error": str(exc),
-                    "warning": "",
-                    "message": "Unable to start GitHub authorization.",
-                }
-            )
-            return _flow_snapshot_unlocked()
-
-    with _AUTH_FLOW_LOCK:
-        _AUTH_FLOW_STATE.update(
-            {
-                "state": "pending",
-                "flow_id": flow_id,
-                "started_at": started_at,
-                "expires_at": expires_at,
-                "poll_interval_seconds": interval,
-                "verification_uri": verification_uri,
-                "verification_uri_complete": verification_uri_complete if isinstance(verification_uri_complete, str) else None,
-                "user_code": user_code,
-                "error": "",
-                "warning": "",
-                "message": "Open GitHub in the browser and enter the code shown here.",
-            }
-        )
-
-    Thread(
-        target=_complete_browser_auth_flow,
-        kwargs={
-            "flow_id": flow_id,
-            "device_code": device_code,
-            "interval": interval,
-            "expires_in": expires_in,
-        },
-        daemon=True,
-    ).start()
-
-    with _AUTH_FLOW_LOCK:
-        return _flow_snapshot_unlocked()
+    raise RuntimeError("Copilot is disabled in this BPS-only build.")
 
 
 def _friendly_auth_failure_message(exc: Exception) -> str:
@@ -478,32 +240,8 @@ def _friendly_auth_failure_message(exc: Exception) -> str:
 
 
 def get_api_key(*, interactive: bool = False) -> str:
-    """Returns a valid GHCP API key, refreshing transparently when expired."""
-    key = load_api_key()
-    if key:
-        return key
-    access_token = load_access_token()
-    if not access_token:
-        if not interactive:
-            raise RuntimeError("GitHub Copilot authorization required.")
-        access_token = _device_flow()
-    return _refresh_api_key(access_token)
+    raise RuntimeError("Copilot is disabled in this BPS-only build.")
 
 
 def ensure_authenticated():
-    """
-    Called at startup — before the server accepts any requests.
-    Runs the full auth flow interactively in the terminal if needed.
-    """
-    print("Checking GitHub Copilot authentication...", flush=True)
-    try:
-        key = get_api_key(interactive=True)
-        print("Authenticated. GHCP API key valid.", flush=True)
-        return key
-    except Exception as e:
-        print(
-            f"\nAuthentication failed: {_friendly_auth_failure_message(e)}",
-            file=sys.stderr,
-            flush=True,
-        )
-        sys.exit(1)
+    raise RuntimeError("Copilot is disabled in this BPS-only build.")

@@ -1,20 +1,21 @@
 """
-Lightweight GitHub Copilot reverse proxy — Responses API path.
+Local BPS reverse proxy — Responses API path.
 Designed for Codex / codex-mini / gpt-5.1-codex and any model that
 requires the Responses API instead of Chat Completions.
 
 Usage:
   python proxy.py
   → If no token exists, prompts you to authorize via GitHub device flow
-  → Then starts serving on http://127.0.0.1:8000
+  → Then starts serving on http://127.0.0.1:8001
 
 Configure Codex:
-  export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+  export OPENAI_BASE_URL=http://127.0.0.1:8001/v1
   export OPENAI_API_KEY=anything
 """
 
 import base64
 import copy
+import client_tool_recovery
 import os
 import sys
 
@@ -63,12 +64,17 @@ import copilot_sdk_upstream
 import dashboard as dashboard_module
 import excel_session_capture
 import excel_upstream
+import openai_oauth
+import outbound_proxy
+import bps_credentials
+import bps_failover
 import format_translation
 import gzip
 import hashlib
 import messages_preprocess
 import migrate_runtime_paths
 import json
+import logging
 import sqlite3
 import tempfile
 import time
@@ -112,6 +118,9 @@ from proxy_client_config import (
 # ─── Import from new modules ─────────────────────────────────────────────────
 
 from constants import (
+    PROXY_PORT,
+    PROXY_BASE_URL,
+    CODEX_PROXY_BASE_URL,
     CLIENT_PROXY_SETTINGS_FILE,
     DASHBOARD_FILE,
     DETAILED_REQUEST_HISTORY_LIMIT,
@@ -148,7 +157,27 @@ from rate_limiting import (
 
 # ─── App & Global State ──────────────────────────────────────────────────────
 
+from attachment_store import AttachmentStore, FileStoreError
+from attachment_api import create_attachment_router, file_owner_scope
+import attachment_inputs
+
+import desktop_control
+
+_DESKTOP_SERVER = None
+
+
+def _desktop_shutdown_callback():
+    server = _DESKTOP_SERVER
+    return (lambda: setattr(server, 'should_exit', True)) if server is not None else None
+
+
 app = FastAPI()
+_attachment_store = AttachmentStore()
+app.include_router(create_attachment_router(_attachment_store, PROXY_PORT))
+desktop_service_controller = desktop_control.DesktopServiceController(
+    os.path.dirname(os.path.abspath(__file__)), PROXY_PORT, _desktop_shutdown_callback,
+)
+app.include_router(desktop_service_controller.router)
 _REQUEST_TRACE_LOCK = Lock()
 _REQUEST_PROMPT_LOCK = Lock()
 _REQUEST_PROMPT_ACTIVE_IDS: set[str] = set()
@@ -674,6 +703,8 @@ _EXCEL_UPSTREAM_CLIENT: "httpx.AsyncClient | None" = None
 _UPSTREAM_CLIENT_LOCK = threading.Lock()
 _UPSTREAM_CLIENT_SHUTDOWN_REGISTERED = False
 _EXCEL_NON_STREAMING_RETRY_ATTEMPTS = 2
+_EXCEL_UPSTREAM_CLIENT_KEY = None
+_RETIRED_EXCEL_UPSTREAM_CLIENTS = []
 
 
 def _build_upstream_client(
@@ -750,15 +781,27 @@ def _get_upstream_client() -> "httpx.AsyncClient":
 
 
 def _get_excel_upstream_client() -> "httpx.AsyncClient":
-    """Keep Excel traffic isolated from the shared Copilot transport pool."""
-    global _EXCEL_UPSTREAM_CLIENT
-    if _EXCEL_UPSTREAM_CLIENT is not None:
-        return _EXCEL_UPSTREAM_CLIENT
+    """Rotate transport on settings changes without closing in-flight streams."""
+    global _EXCEL_UPSTREAM_CLIENT, _EXCEL_UPSTREAM_CLIENT_KEY
+    current = outbound_proxy.settings.load()
+    key = (current['enabled'], current['url'])
     with _UPSTREAM_CLIENT_LOCK:
-        if _EXCEL_UPSTREAM_CLIENT is None:
-            _EXCEL_UPSTREAM_CLIENT = _build_upstream_client(http2_override=False)
-            _ensure_upstream_client_shutdown_registered()
-    return _EXCEL_UPSTREAM_CLIENT
+        if _EXCEL_UPSTREAM_CLIENT is not None and _EXCEL_UPSTREAM_CLIENT_KEY == key:
+            return _EXCEL_UPSTREAM_CLIENT
+        if current['enabled']:
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(configured_upstream_timeout_seconds()),
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=8, keepalive_expiry=300),
+                http2=False, verify=True, **outbound_proxy.httpx_client_kwargs(current),
+            )
+        else:
+            client = _build_upstream_client(http2_override=False)
+        if _EXCEL_UPSTREAM_CLIENT is not None:
+            _RETIRED_EXCEL_UPSTREAM_CLIENTS.append(_EXCEL_UPSTREAM_CLIENT)
+        _EXCEL_UPSTREAM_CLIENT = client
+        _EXCEL_UPSTREAM_CLIENT_KEY = key
+        _ensure_upstream_client_shutdown_registered()
+        return client
 
 
 class _DownstreamDisconnectedBeforeResponse(RuntimeError):
@@ -873,14 +916,13 @@ async def _open_streaming_upstream(
 
 
 def _shutdown_upstream_client() -> None:
-    global _UPSTREAM_CLIENT, _EXCEL_UPSTREAM_CLIENT
-    clients = [
-        client
-        for client in (_UPSTREAM_CLIENT, _EXCEL_UPSTREAM_CLIENT)
-        if client is not None
-    ]
+    global _UPSTREAM_CLIENT, _EXCEL_UPSTREAM_CLIENT, _EXCEL_UPSTREAM_CLIENT_KEY
+    candidates = [_UPSTREAM_CLIENT, _EXCEL_UPSTREAM_CLIENT, *_RETIRED_EXCEL_UPSTREAM_CLIENTS]
+    clients = list({id(client): client for client in candidates if client is not None}.values())
     _UPSTREAM_CLIENT = None
     _EXCEL_UPSTREAM_CLIENT = None
+    _EXCEL_UPSTREAM_CLIENT_KEY = None
+    _RETIRED_EXCEL_UPSTREAM_CLIENTS.clear()
     if not clients:
         return
     try:
@@ -894,7 +936,7 @@ def _shutdown_upstream_client() -> None:
         pass
 
 
-def _proxy_port_in_use(host: str = "127.0.0.1", port: int = 8000) -> bool:
+def _proxy_port_in_use(host: str = "127.0.0.1", port: int = PROXY_PORT) -> bool:
     import socket
 
     try:
@@ -945,38 +987,33 @@ try:
 except Exception as _codex_ingest_exc:  # pragma: no cover - best effort
     print(f"codex_native_ingest: disabled ({_codex_ingest_exc})", flush=True)
 
-try:
-    _copilot_sdk_interval = float(os.environ.get("GHCP_COPILOT_SDK_INGEST_INTERVAL", "5") or 5)
-    if _copilot_sdk_interval > 0:
-        copilot_sdk_upstream.start_background_scanner(
-            usage_tracker.record_usage_event,
-            interval_seconds=_copilot_sdk_interval,
-        )
-except Exception as _sdk_ingest_exc:  # pragma: no cover - best effort
-    print(f"copilot_sdk_ingest: disabled ({_sdk_ingest_exc})", flush=True)
+# Copilot SDK ingestion is permanently disabled in this BPS-only build.
 
 
 @app.on_event("startup")
 async def _app_startup_restore_client_proxy_configs():
     excel_upstream.excel_session_store.load()
-    asyncio.create_task(asyncio.to_thread(
-        excel_session_capture.refresh_macos_excel_session,
-        excel_upstream.excel_session_store,
-        force=True,
-    ))
-    asyncio.create_task(asyncio.to_thread(
-        excel_session_capture.refresh_windows_excel_session,
-        excel_upstream.excel_session_store,
-        force=True,
-    ))
+    openai_oauth.login_service.load()
+    bps_credentials.credential_pool.load()
+    # Finish the one-time legacy capture before migrating, so an empty startup
+    # cannot permanently miss an existing Excel credential. Deleted pool rows
+    # are never reimported by migrate_legacy on subsequent boots.
+    await asyncio.to_thread(excel_session_capture.refresh_macos_excel_session,
+                            excel_upstream.excel_session_store, force=True)
+    await asyncio.to_thread(excel_session_capture.refresh_windows_excel_session,
+                            excel_upstream.excel_session_store, force=True)
+    bps_credentials.credential_pool.migrate_legacy(
+        excel_upstream.excel_session_store, openai_oauth.login_service,
+    )
     restore_client_proxy_configs_on_startup()
     auto_update_runtime_controller.start_periodic_checks()
 
 
 @app.on_event("shutdown")
 async def _app_shutdown_revert_client_proxy_configs():
+    await asyncio.to_thread(openai_oauth.login_service.cancel)
     await auto_update_runtime_controller.stop_periodic_checks()
-    await copilot_sdk_upstream.shutdown()
+    # No Copilot SDK is started or shut down in BPS-only mode.
     revert_client_proxy_configs_on_shutdown()
 
 
@@ -3357,6 +3394,12 @@ def _finish_usage_and_trace(
 ) -> None:
     if isinstance(plan, UpstreamRequestPlan):
         try:
+            correction = (plan.trace_context or {}).get("client_tool_correction", {})
+            totals = correction.get("total_usage") if isinstance(correction, dict) else None
+            if isinstance(totals, dict) and totals:
+                usage = dict(totals)
+                if isinstance(response_payload, dict):
+                    response_payload = {**response_payload, "usage": usage}
             _protect_plan_prompt_trace_state(plan)
             usage_tracker.finish_event(
                 plan.usage_event,
@@ -4085,6 +4128,15 @@ def _handle_upstream_error(
     fallback_trace=None,
     is_compact: bool = False,
 ) -> Response:
+    # Keep BPS account failures as errors until the credential selector can
+    # retry. A synthetic 200 assistant reply would mask quota/auth failures.
+    if (isinstance(trace_plan, UpstreamRequestPlan)
+            and trace_plan.upstream_url == excel_upstream.RESPONSES_URL
+            and bps_failover.should_failover(upstream.status_code, _extract_upstream_json_payload(upstream))):
+        response_payload, response_text = _default_upstream_error_trace(upstream)
+        _finish_usage_and_trace(trace_plan, upstream.status_code, upstream=upstream,
+                                response_payload=response_payload, response_text=response_text)
+        return proxy_non_streaming_response(upstream)
     synthetic = upstream_errors.translate(upstream)
     if synthetic is not None:
         response_payload = protocol_replies.build_synthetic_payload(
@@ -5138,103 +5190,8 @@ _COPILOT_MODEL_CAPS_FETCH_TIMEOUT_SECONDS = 5.0
 
 
 def fetch_copilot_model_capabilities() -> dict[str, dict]:
-    """Best-effort fetch of upstream Copilot /models capabilities.
-
-    Returns a mapping ``{model_id: capabilities_dict}`` enriched into the
-    shape consumed by ``ProxyClientConfigService``. Any failure (missing
-    auth, network error, parse error) returns an empty dict so the caller
-    falls back to defaults.
-    """
-    try:
-        api_base = auth.get_api_base().rstrip("/")
-    except Exception:
-        return excel_upstream.merge_local_model_capabilities({})
-
-    now = time.monotonic()
-    with _COPILOT_MODEL_CAPS_LOCK:
-        cache = _COPILOT_MODEL_CAPS_CACHE
-        if (
-            cache.get("key") == api_base
-            and isinstance(cache.get("data"), dict)
-            and cache["data"]
-            and (now - float(cache.get("ts", 0.0))) < _COPILOT_MODEL_CAPS_TTL_SECONDS
-        ):
-            return excel_upstream.merge_local_model_capabilities(cache["data"])  # type: ignore[arg-type]
-
-    try:
-        api_key = auth.get_api_key()
-    except Exception:
-        return excel_upstream.merge_local_model_capabilities({})
-
-    headers = format_translation.build_copilot_headers(api_key)
-    url = f"{api_base}/models"
-    try:
-        with httpx.Client(timeout=_COPILOT_MODEL_CAPS_FETCH_TIMEOUT_SECONDS) as client:
-            response = client.get(url, headers=headers)
-            response.raise_for_status()
-            payload = response.json()
-    except Exception:
-        return excel_upstream.merge_local_model_capabilities({})
-
-    raw_entries = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(raw_entries, list):
-        return excel_upstream.merge_local_model_capabilities({})
-
-    result: dict[str, dict] = {}
-    for entry in raw_entries:
-        if not isinstance(entry, dict):
-            continue
-        model_id = entry.get("id")
-        if not isinstance(model_id, str) or not model_id:
-            continue
-        caps = entry.get("capabilities") if isinstance(entry.get("capabilities"), dict) else {}
-        limits = caps.get("limits") if isinstance(caps.get("limits"), dict) else {}
-        supports = caps.get("supports") if isinstance(caps.get("supports"), dict) else {}
-
-        max_context_window = limits.get("max_context_window_tokens")
-        max_prompt_tokens = limits.get("max_prompt_tokens")
-        reasoning_efforts = supports.get("reasoning_effort") if isinstance(supports.get("reasoning_effort"), list) else None
-        vision_flag = bool(supports.get("vision"))
-        parallel = supports.get("parallel_tool_calls")
-        input_modalities = ["text", "image"] if vision_flag else ["text"]
-
-        enriched: dict[str, object] = {
-            "input_modalities": input_modalities,
-            "vision": vision_flag,
-        }
-        picker_enabled = entry.get("model_picker_enabled")
-        if isinstance(picker_enabled, bool):
-            enriched["model_picker_enabled"] = picker_enabled
-        display_name = entry.get("name")
-        if isinstance(display_name, str) and display_name.strip():
-            enriched["display_name"] = display_name.strip()
-        vendor = entry.get("vendor")
-        if isinstance(vendor, str) and vendor.strip():
-            enriched["provider"] = vendor.strip()
-        if isinstance(max_prompt_tokens, int) and max_prompt_tokens > 0:
-            enriched["context_window"] = max_prompt_tokens
-        elif isinstance(max_context_window, int) and max_context_window > 0:
-            enriched["context_window"] = max_context_window
-        if isinstance(max_context_window, int) and max_context_window > 0:
-            enriched["max_context_window"] = max_context_window
-        elif isinstance(max_prompt_tokens, int) and max_prompt_tokens > 0:
-            enriched["max_context_window"] = max_prompt_tokens
-        if reasoning_efforts is not None:
-            enriched["reasoning_efforts"] = reasoning_efforts
-        if isinstance(parallel, bool):
-            enriched["parallel_tool_calls"] = parallel
-        supported_endpoints = entry.get("supported_endpoints") or []
-        if not isinstance(supported_endpoints, list):
-            supported_endpoints = []
-        enriched["supported_endpoints"] = list(supported_endpoints)
-        enriched["messages_endpoint_supported"] = "/v1/messages" in supported_endpoints
-        result[model_id] = enriched
-
-    with _COPILOT_MODEL_CAPS_LOCK:
-        _COPILOT_MODEL_CAPS_CACHE["key"] = api_base
-        _COPILOT_MODEL_CAPS_CACHE["ts"] = now
-        _COPILOT_MODEL_CAPS_CACHE["data"] = result
-    return excel_upstream.merge_local_model_capabilities(result)
+    """Compatibility name; capabilities are exclusively local BPS metadata."""
+    return excel_upstream.merge_local_model_capabilities({})
 
 
 # Models known to natively support Anthropic /v1/messages upstream. This is a
@@ -5278,31 +5235,8 @@ def model_supports_native_messages(model: str) -> bool:
     return False
 
 
-async def _proxy_models_request() -> Response:
-    try:
-        api_key = auth.get_api_key()
-    except Exception:
-        return JSONResponse(content=excel_upstream.merge_local_models_payload({}))
-
-    upstream_url = f"{auth.get_api_base().rstrip('/')}/models"
-    headers = format_translation.build_copilot_headers(api_key)
-
-    try:
-        client = _get_upstream_client()
-        request = client.build_request("GET", upstream_url, headers=headers)
-        upstream = await throttled_client_send(client, request)
-    except httpx.RequestError as exc:
-        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        return format_translation.openai_error_response(status_code, message)
-
-    if upstream.status_code < 400:
-        payload = _extract_upstream_json_payload(upstream)
-        if isinstance(payload, dict):
-            return JSONResponse(
-                content=excel_upstream.merge_local_models_payload(payload),
-                status_code=upstream.status_code,
-            )
-    return proxy_non_streaming_response(upstream)
+async def _proxy_models_request():
+    return JSONResponse(content=excel_upstream.merge_local_models_payload({}))
 
 
 # ─── Dashboard routes ─────────────────────────────────────────────────────────
@@ -5512,25 +5446,17 @@ async def request_prompt_api(request_id: str):
 
 @app.get("/api/auth/status")
 async def auth_status_api():
-    status = auth.auth_status()
-    # GPT Excel works without Copilot, so users may skip the setup screen.
-    try:
-        settings = client_proxy_config_service.load_client_proxy_settings()
-        status["setup_skipped"] = bool(settings.get("setup_skipped"))
-    except HTTPException:
-        status["setup_skipped"] = False
-    return JSONResponse(
-        content=status,
-        headers={"Cache-Control": "no-store"},
-    )
+    return JSONResponse(content={"status": "disabled", "authenticated": False,
+        "enabled": False, "provider": "copilot", "setup_skipped": True,
+        "message": "Copilot 已禁用，请使用 ChatGPT / BPS 凭证。"},
+        headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/auth/device")
 async def auth_device_api():
-    return JSONResponse(
-        content=auth.begin_device_flow(),
-        headers={"Cache-Control": "no-store"},
-    )
+    return JSONResponse(status_code=410, content={"error": {"code": "copilot_disabled",
+        "message": "Copilot 登录已禁用，请使用 ChatGPT / BPS 凭证。"}},
+        headers={"Cache-Control": "no-store"})
 
 
 # ─── Config API routes ────────────────────────────────────────────────────────
@@ -5581,6 +5507,7 @@ async def model_routing_status_api():
 @app.post("/api/config/model-remapping")
 @app.post("/api/config/model-routing")
 async def model_routing_config_api(request: Request):
+    _require_local_bps_management(request, write=True)
     payload = await parse_json_request(request)
     result = model_routing_config_service.save_settings(payload)
     client_proxy_config_service.refresh_client_model_metadata()
@@ -5756,12 +5683,169 @@ async def excel_session_status_api():
         content={
             **excel_upstream.excel_session_store.status(),
             "capture": excel_session_capture.cached_session_reader_status(),
+            "oauth": openai_oauth.login_service.status(),
         }
     )
 
 
+def _require_local_oauth_action(request: Request) -> None:
+    # JSON plus exact same-origin validation prevents cross-site login/logout.
+    if request.client and request.client.host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="OAuth management is loopback-only.")
+    host = request.headers.get("host", "").lower()
+    if host not in {f"127.0.0.1:{PROXY_PORT}", f"localhost:{PROXY_PORT}"}:
+        raise HTTPException(status_code=403, detail="Unexpected OAuth management host.")
+    origin = request.headers.get("origin")
+    if origin and origin != f"http://{host}":
+        raise HTTPException(status_code=403, detail="Cross-origin OAuth management is not allowed.")
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        raise HTTPException(status_code=415, detail="Use application/json.")
+
+
+def _require_local_bps_management(request: Request, *, write: bool = False):
+    if request.client and request.client.host not in {'127.0.0.1', '::1'}:
+        raise HTTPException(status_code=403, detail='凭证和代理管理仅允许本机访问。')
+    host = request.headers.get('host', '').lower()
+    if host not in {f'127.0.0.1:{PROXY_PORT}', f'localhost:{PROXY_PORT}'}:
+        raise HTTPException(status_code=403, detail='Unexpected management host.')
+    origin = request.headers.get('origin')
+    if (origin and origin != f'http://{host}') or request.headers.get('sec-fetch-site') == 'cross-site':
+        raise HTTPException(status_code=403, detail='禁止跨站管理请求。')
+    if write and request.headers.get('content-type', '').split(';', 1)[0].strip().lower() != 'application/json':
+        raise HTTPException(status_code=415, detail='Use application/json.')
+
+
+@app.get('/api/config/outbound-proxy')
+async def outbound_proxy_status_api(request: Request):
+    _require_local_bps_management(request)
+    try:
+        return JSONResponse(outbound_proxy.settings.load(), headers={'Cache-Control': 'no-store'})
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post('/api/config/outbound-proxy')
+async def outbound_proxy_config_api(request: Request):
+    _require_local_bps_management(request, write=True)
+    payload = await parse_json_request(request)
+    try:
+        result = await asyncio.to_thread(outbound_proxy.settings.save, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/credentials')
+async def bps_credentials_status_api(request: Request):
+    _require_local_bps_management(request)
+    try:
+        result = await asyncio.to_thread(bps_credentials.credential_pool.list_credentials)
+    except bps_credentials.PoolError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/credentials/{credential_id}')
+async def bps_credentials_update_api(credential_id: str, request: Request):
+    _require_local_bps_management(request, write=True)
+    payload = await parse_json_request(request)
+    try:
+        await asyncio.to_thread(bps_credentials.credential_pool.update, credential_id, payload)
+        result = bps_credentials.credential_pool.list_credentials()
+    except bps_credentials.PoolError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+
+@app.delete('/api/credentials/{credential_id}')
+async def bps_credentials_delete_api(credential_id: str, request: Request):
+    _require_local_bps_management(request, write=True)
+    try:
+        await asyncio.to_thread(bps_credentials.credential_pool.remove, credential_id)
+        result = bps_credentials.credential_pool.list_credentials()
+    except bps_credentials.PoolError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/credentials/{credential_id}/test')
+async def bps_credentials_test_api(credential_id: str, request: Request):
+    _require_local_bps_management(request, write=True)
+    result = await _handle_excel_responses(request, {
+        'model': 'gpt-6-sol', 'input': 'Reply only OK.', 'stream': False,
+        'prompt_cache_key': 'credential-probe-' + uuid4().hex,
+    }, credential_id=credential_id)
+    try:
+        payload = json.loads(result.body)
+    except (ValueError, AttributeError):
+        payload = {}
+    ok = (result.status_code == 200 and payload.get('status') == 'completed'
+          and not payload.get('error') and bool(payload.get('output')))
+    message = 'BPS 验证通过。' if ok else f'BPS 验证失败（HTTP {result.status_code}），请检查凭证、额度和代理设置。'
+    try:
+        if result.headers.get('x-ghcp-credential-id') == credential_id:
+            revision = result.headers.get('x-ghcp-credential-revision')
+            if revision is not None and revision.isdigit():
+                bps_credentials.credential_pool.record_probe(credential_id, ok, message,
+                                                             expected_revision=int(revision))
+        credentials = bps_credentials.credential_pool.list_credentials()
+    except bps_credentials.PoolError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return JSONResponse({'ok': ok, 'status': result.status_code, 'message': message,
+                         'credentials': credentials}, headers={'Cache-Control': 'no-store'})
+
+
+@app.post("/api/config/excel-oauth/start")
+async def excel_oauth_start_api(request: Request):
+    _require_local_oauth_action(request)
+    try:
+        result = await asyncio.to_thread(openai_oauth.login_service.start)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/config/excel-oauth/cancel")
+async def excel_oauth_cancel_api(request: Request):
+    _require_local_oauth_action(request)
+    await asyncio.to_thread(openai_oauth.login_service.cancel)
+    return JSONResponse(openai_oauth.login_service.status(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/config/excel-oauth/test")
+async def excel_oauth_test_api(request: Request):
+    _require_local_oauth_action(request)
+    # Explicit user action only: this sends a small, billable model request.
+    try:
+        result = await _handle_excel_responses(request, {
+            "model": "gpt-6-sol", "input": "Reply only OK.", "stream": False,
+        })
+        try:
+            payload = json.loads(result.body)
+        except (ValueError, AttributeError):
+            payload = {}
+        ok = (result.status_code == 200 and isinstance(payload, dict)
+              and not payload.get("error") and bool(payload.get("output")))
+        message = ("BPS 验证通过：gpt-6-sol 已成功返回推理结果。" if ok else
+                   f"BPS 验证失败（HTTP {result.status_code}）。登录成功不代表具备 BPS 权限；可能是凭证适用范围、工作区权限或模型可用性不同。")
+    except (RuntimeError, httpx.HTTPError):
+        ok = False
+        message = "BPS 验证未完成，请检查登录凭证有效期、网络和代理设置。"
+    openai_oauth.login_service.record_probe(ok, message)
+    return JSONResponse({"ok": ok, "message": message}, headers={"Cache-Control": "no-store"})
+
+
+def _import_explicit_excel_credential():
+    try:
+        bps_credentials.credential_pool.load()
+        bps_credentials.credential_pool.upsert_session(excel_upstream.excel_session_store)
+    except bps_credentials.PoolError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
 @app.post("/api/config/excel-session")
 async def excel_session_config_api(request: Request):
+    _require_local_bps_management(request, write=True)
     payload = await parse_json_request(request)
     action = str(payload.get("action") or "").strip().lower()
     if action in {"cancel_capture", "cancel_read"}:
@@ -5769,6 +5853,7 @@ async def excel_session_config_api(request: Request):
             content={
                 **excel_upstream.excel_session_store.status(),
                 "capture": excel_session_capture.cached_session_reader_status(),
+                "oauth": openai_oauth.login_service.status(),
             }
         )
     if action in {"capture", "read_cached"}:
@@ -5780,10 +5865,13 @@ async def excel_session_config_api(request: Request):
             excel_upstream.excel_session_store,
             force=True,
         )
+        if excel_upstream.excel_session_store.status().get('configured'):
+            _import_explicit_excel_credential()
         return JSONResponse(
             content={
                 **excel_upstream.excel_session_store.status(),
                 "capture": excel_session_capture.cached_session_reader_status(),
+                "oauth": openai_oauth.login_service.status(),
             }
         )
     try:
@@ -5793,28 +5881,47 @@ async def excel_session_config_api(request: Request):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _import_explicit_excel_credential()
     return JSONResponse(
         content={
             **status,
             "capture": excel_session_capture.cached_session_reader_status(),
+            "oauth": openai_oauth.login_service.status(),
         }
     )
 
 
 @app.delete("/api/config/excel-session")
-async def excel_session_clear_api():
+async def excel_session_clear_api(request: Request):
+    if excel_upstream.excel_session_store.status().get("source") == "oauth":
+        _require_local_oauth_action(request)
+    await asyncio.to_thread(openai_oauth.login_service.clear)
     return JSONResponse(
         content={
             **excel_upstream.excel_session_store.clear(),
             "capture": excel_session_capture.cached_session_reader_status(),
+            "oauth": openai_oauth.login_service.status(),
         }
     )
 
 
 @app.post("/api/config/auto-update")
 async def auto_update_config_api(request: Request):
+    _require_local_bps_management(request, write=True)
     payload = await parse_json_request(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="A JSON object is required.")
     action = str(payload.get("action") or "").strip().lower()
+    if action == "set_enabled":
+        try:
+            settings = auto_update_manager.set_enabled(payload.get("enabled"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if auto_update_manager.enabled():
+            auto_update_runtime_controller.start_periodic_checks()
+        else:
+            await auto_update_runtime_controller.stop_periodic_checks()
+        return JSONResponse(content={**auto_update_runtime_controller.status_payload(), "settings": settings})
     if action == "set_mode":
         mode = str(payload.get("mode") or "").strip().lower()
         try:
@@ -5928,10 +6035,255 @@ def _excel_tool_call_event_bytes(
     ]
 
 
-def _excel_tool_stream_transform(source_body: dict):
-    allowed_tools = excel_upstream.client_tool_types(source_body)
-    if not allowed_tools:
+def _recoverable_excel_tool_response(
+    response: dict | None, source: dict, *,
+    trace_plan: UpstreamRequestPlan | None = None,
+    diagnostic_reason: str | None = None,
+) -> dict | None:
+    """Reject unsafe dispatch without reporting a proxy formatting issue as EOF."""
+    if not isinstance(response, dict) or response.get("status") in {"failed", "incomplete"}:
         return None
+    output = response.get("output")
+    if not isinstance(output, list):
+        return None
+    call_types = {"function_call", "custom_tool_call"}
+    if not any(isinstance(item, dict) and item.get("type") in call_types for item in output) and not excel_upstream.client_tool_selection_issue(response, source):
+        return None
+    diagnostics = excel_upstream.client_tool_rejection_diagnostics(response, source)
+    tool_structure = excel_upstream.client_tool_rejection_structure(response)
+    tool_catalog = excel_upstream.client_tool_catalog_diagnostic(source)
+    if diagnostic_reason:
+        diagnostics = [{"tool": "<tool_stream>", "reason": diagnostic_reason}]
+    request_id = trace_plan.request_id if isinstance(trace_plan, UpstreamRequestPlan) else None
+    logging.getLogger(__name__).warning(
+        "BPS client tool conversion rejected (no dispatch) [request_id=%s]: %s",
+        request_id or "-",
+        json.dumps({"diagnostics": diagnostics, "tool_structure": tool_structure, "tool_catalog": tool_catalog},
+                   ensure_ascii=True, separators=(",", ":")),
+    )
+    if isinstance(trace_plan, UpstreamRequestPlan):
+        rejection = {"diagnostics": diagnostics, "tool_structure": tool_structure, "tool_catalog": tool_catalog, "dispatched": False}
+        if isinstance(trace_plan.trace_context, dict):
+            trace_plan.trace_context["client_tool_rejection"] = rejection
+        _append_request_trace({
+            "event": "client_tool_rejected", "time": util.utc_now_iso(),
+            "request_id": request_id, "model": trace_plan.resolved_model,
+            **rejection,
+        })
+    detail = "; ".join(
+        f"{issue['tool']}: {issue['reason']}" for issue in diagnostics[:5]
+    ) or "unmatched client tool call"
+    message = (
+        "[tool_conversion_rejected] 代理未能安全转换本轮工具调用，因此本批次没有执行任何工具。"
+        "这不是登录失效或网络断连；请重试本轮请求。诊断：" + detail
+    )
+    if request_id:
+        message += "；请求 ID：" + request_id
+    safe_output = []
+    first = True
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") not in call_types:
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                item = {key: value for key, value in item.items() if key != "encrypted_content"}
+            safe_output.append(item)
+            continue
+        # Preserve every output index, including non-tool items after a call.
+        text = message if first else "同批次的此项工具调用也未执行。"
+        first = False
+        safe_output.append({
+            "type": "message", "id": f"msg_proxy_tool_rejection_{uuid4().hex}",
+            "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        })
+    return {**response, "status": "completed", "output": safe_output,
+            "error": None, "incomplete_details": None}
+
+
+def _excel_tool_rejection_event_bytes(response: dict) -> list[bytes]:
+    events = []
+    for index, item in enumerate(response["output"]):
+        if not isinstance(item, dict) or not str(item.get("id", "")).startswith("msg_proxy_tool_rejection_"):
+            continue
+        part = item["content"][0]
+        base = {"item_id": item["id"], "output_index": index, "content_index": 0}
+        payloads = [
+            ("response.output_item.added", {"output_index": index, "item": {**item, "status": "in_progress", "content": []}}),
+            ("response.content_part.added", {**base, "part": {**part, "text": ""}}),
+            ("response.output_text.delta", {**base, "delta": part["text"]}),
+            ("response.output_text.done", {**base, "text": part["text"]}),
+            ("response.content_part.done", {**base, "part": part}),
+            ("response.output_item.done", {"output_index": index, "item": item}),
+        ]
+        events.extend(format_translation.sse_encode(kind, {"type": kind, **data}) for kind, data in payloads)
+    events.append(format_translation.sse_encode(
+        "response.completed", {"type": "response.completed", "response": response},
+    ))
+    return events
+
+
+def _reconcile_excel_tool_response(response, observed_items, identities, native_events_seen):
+    """Repair only identity fields proven by the same upstream call IDs."""
+    call_types = {"function_call", "custom_tool_call"}
+    output = response.get("output", []) if isinstance(response, dict) else []
+    output = output if isinstance(output, list) else []
+    rebuilt = []
+    conflict = False
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") not in call_types:
+            rebuilt.append(item)
+            continue
+        matches = [seen for seen in identities if any(
+            isinstance(item.get(key), str) and item[key] and item[key] == seen.get(key)
+            for key in ("id", "call_id")
+        )]
+        values = {}
+        for field in ("type", "id", "call_id", "name", "namespace"):
+            present = [part.get(field) for part in [item, *matches]
+                       if part.get(field) is not None and part.get(field) != ""]
+            if any(not isinstance(value, str) for value in present):
+                conflict = True
+                continue
+            unique = set(present)
+            if len(unique) > 1:
+                conflict = True
+            if len(unique) == 1:
+                values[field] = next(iter(unique))
+        repaired = dict(item)
+        if matches and not conflict:
+            for field in ("name", "namespace"):
+                if repaired.get(field) in (None, "") and field in values:
+                    repaired[field] = values[field]
+        rebuilt.append(repaired)
+    final_calls = [item for item in rebuilt if isinstance(item, dict) and item.get("type") in call_types]
+    final_ids = {item[key] for item in final_calls for key in ("id", "call_id")
+                 if isinstance(item.get(key), str) and item[key]}
+    observed_calls = {index: item for index, item in observed_items.items() if item.get("type") in call_types}
+    missing = {index: item for index, item in observed_calls.items() if not any(
+        isinstance(item.get(key), str) and item[key] in final_ids for key in ("id", "call_id")
+    )}
+    incomplete = native_events_seen and (not final_calls or bool(missing))
+    if incomplete:
+        merged = {**observed_items, **dict(enumerate(rebuilt)), **missing}
+        rebuilt = [merged[index] for index in sorted(merged)]
+        if not any(isinstance(item, dict) and item.get("type") in call_types for item in rebuilt):
+            rebuilt.append({"type": "function_call", "name": "run_officejs", "arguments": ""})
+    reason = "conflicting_tool_identity" if conflict else "incomplete_tool_stream" if incomplete else None
+    return ({**(response or {}), "output": rebuilt}, reason)
+
+
+async def _retry_excel_tool_conversion(plan, source, rejected, *, diagnostic_reason=None):
+    """One additional inference, only before any rejected-batch tool dispatch."""
+    if not isinstance(plan, UpstreamRequestPlan):
+        return None
+    retry_body = client_tool_recovery.correction_body(plan.body, source, rejected, diagnostic_reason)
+    if retry_body is None:
+        return None
+    if not isinstance(plan.trace_context, dict):
+        plan.trace_context = {}
+    if plan.trace_context.get("client_tool_correction"):
+        return None
+    record = {"attempt": 1, "outcome": "started", "dispatched": False, "timeout_seconds": 120,
+              "diagnostics": excel_upstream.client_tool_rejection_diagnostics(rejected, source),
+              "tool_catalog": excel_upstream.client_tool_catalog_diagnostic(source)}
+    if diagnostic_reason:
+        record["stream_reason"] = diagnostic_reason
+    plan.trace_context["client_tool_correction"] = record
+    _append_request_trace({"event": "client_tool_correction_started", "time": util.utc_now_iso(),
+                           "request_id": plan.request_id, **record})
+    async def send_correction():
+        upstream = None
+        try:
+            client = _get_excel_upstream_client()
+            request = client.build_request("POST", plan.upstream_url, headers=plan.headers,
+                                           json=retry_body, timeout=httpx.Timeout(120.0, connect=10.0, write=30.0, pool=30.0))
+            upstream = await throttled_client_send(client, request, stream=True)
+            record["http_status"] = upstream.status_code
+            if upstream.status_code >= 400:
+                record["outcome"] = "upstream_http_error"
+                return None
+            if "text/event-stream" in upstream.headers.get("content-type", "").lower():
+                # No trace plan: the parser cannot recursively schedule a retry.
+                candidate = await _read_excel_non_streaming_response_payload(upstream, client_body=source)
+            else:
+                await upstream.aread()
+                candidate = _extract_upstream_json_payload(upstream)
+            if isinstance(candidate, dict):
+                totals = client_tool_recovery.combined_usage(rejected.get("usage"), candidate.get("usage"))
+                if totals:
+                    record["total_usage"] = totals
+            record["correction_diagnostic"] = client_tool_recovery.correction_candidate_diagnostic(rejected, candidate, source)
+            if isinstance(candidate, dict) and isinstance(candidate.get("output"), list):
+                details = []
+                for item in candidate["output"][:8]:
+                    if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                        continue
+                    if item["name"] not in excel_upstream.CLIENT_TOOL_TRANSPORT_ALIASES:
+                        continue
+                    detail = excel_upstream.client_tool_transport.diagnose_transport_envelope_details(item)
+                    if detail:
+                        details.append(detail)
+                if details:
+                    record["correction_transport_details"] = details
+            accepted = client_tool_recovery.accepted_correction(rejected, candidate, source)
+            record["outcome"] = "recovered" if accepted is not None else "correction_rejected"
+            if accepted is not None and record.get("total_usage"):
+                accepted["usage"] = record["total_usage"]
+            return accepted
+        finally:
+            if upstream is not None:
+                await upstream.aclose()
+    try:
+        return await asyncio.wait_for(send_correction(), timeout=120.0)
+    except asyncio.CancelledError:
+        record["outcome"] = "cancelled"
+        raise
+    except Exception as exc:
+        # A recovery attempt must not turn an existing safe rejection into EOF.
+        # Cancellation is deliberately propagated by the preceding branch.
+        record["outcome"] = "request_error"
+        record["error_type"] = type(exc).__name__
+        return None
+    finally:
+        _append_request_trace({"event": "client_tool_correction_finished", "time": util.utc_now_iso(),
+                               "request_id": plan.request_id, **record})
+
+
+def _excel_corrected_response_event_bytes(response, source, prefix_count):
+    calls = excel_upstream.extract_native_client_tool_calls(response, source)
+    payload = excel_upstream.response_payload_with_tool_calls(
+        response, calls, model_id=excel_upstream.excel_model_id(source.get("model")) or excel_upstream.MODEL_ID,
+    ) if calls else response
+    format_translation.normalize_response_reasoning_for_client(payload)
+    for index, item in enumerate(payload.get("output", [])):
+        if index < prefix_count:
+            continue
+        if item.get("type") in client_tool_recovery.CALL_TYPES:
+            yield from _excel_tool_call_event_bytes(item, payload, output_index=index)[:-1]
+            continue
+        started = {**item, "status": "in_progress"}
+        if item.get("type") == "message":
+            started["content"] = []
+        yield format_translation.sse_encode("response.output_item.added", {
+            "type": "response.output_item.added", "output_index": index, "item": started})
+        if item.get("type") == "message":
+            for content_index, part in enumerate(item.get("content", [])):
+                if not isinstance(part, dict) or part.get("type") != "output_text":
+                    continue
+                base = {"item_id": item["id"], "output_index": index, "content_index": content_index}
+                for kind, value in (
+                    ("response.content_part.added", {"part": {**part, "text": ""}}),
+                    ("response.output_text.delta", {"delta": part.get("text", "")}),
+                    ("response.output_text.done", {"text": part.get("text", "")}),
+                    ("response.content_part.done", {"part": part}),
+                ):
+                    yield format_translation.sse_encode(kind, {"type": kind, **base, **value})
+        yield format_translation.sse_encode("response.output_item.done", {
+            "type": "response.output_item.done", "output_index": index, "item": item})
+    yield format_translation.sse_encode("response.completed", {"type": "response.completed", "response": payload})
+
+
+def _excel_tool_stream_transform(source_body: dict, *, trace_plan: UpstreamRequestPlan | None = None):
+    allowed_tools = excel_upstream.client_tool_types(source_body)
     marker_open = excel_upstream.TOOL_CALL_MARKER_OPEN
 
     def _marker_hold_length(text: str) -> int:
@@ -5949,7 +6301,13 @@ def _excel_tool_stream_transform(source_body: dict):
         held_events: list[bytes] = []
         delta_template: dict = {}
         done_seen = False
+        terminal_seen = False
+        native_events_seen = False
+        observed_items: dict[int, dict] = {}
+        observed_tool_identities: list[dict] = []
+        response_identity: dict = {}
         native_tool_output_index: int | None = None
+        native_tool_output_indexes: dict[str, int] = {}
 
         def flush_text() -> list[bytes]:
             nonlocal emitted_upto
@@ -5974,7 +6332,16 @@ def _excel_tool_stream_transform(source_body: dict):
                 continue
             if not isinstance(payload, dict):
                 continue
-            event_type = str(event_name or payload.get("type") or "").strip().lower()
+            if terminal_seen:
+                continue
+            event_type = str(payload.get("type") or event_name or "").strip().lower()
+            if event_type in {"response.created", "response.in_progress"}:
+                candidate = payload.get("response")
+                if isinstance(candidate, dict):
+                    response_identity = {
+                        key: candidate[key] for key in ("id", "object", "created_at", "model")
+                        if key in candidate
+                    }
             event_output_index = payload.get("output_index")
             encoded = format_translation.sse_encode(event_type or "message", payload)
 
@@ -6038,7 +6405,8 @@ def _excel_tool_stream_transform(source_body: dict):
                 "response.custom_tool_call_input.delta",
                 "response.custom_tool_call_input.done",
             }:
-                held_events.append(encoded)
+                native_events_seen = True
+                # Never put native arguments in the assistant-text release queue.
                 continue
 
             if event_type in {"response.output_item.added", "response.output_item.done"}:
@@ -6046,10 +6414,17 @@ def _excel_tool_stream_transform(source_body: dict):
                 item_type = (
                     item.get("type") if isinstance(item, dict) else None
                 )
+                if isinstance(item, dict) and isinstance(event_output_index, int) and event_output_index >= 0:
+                    observed_items[event_output_index] = dict(item)
                 if item_type in {"function_call", "custom_tool_call"}:
+                    native_events_seen = True
+                    observed_tool_identities.append({key: item[key] for key in
+                        ("type", "id", "call_id", "name", "namespace") if key in item})
                     if isinstance(event_output_index, int) and event_output_index >= 0:
                         native_tool_output_index = event_output_index
-                    held_events.append(encoded)
+                        key = item.get("call_id") or item.get("id")
+                        if isinstance(key, str):
+                            native_tool_output_indexes[key] = event_output_index
                     continue
                 if (
                     event_type == "response.output_item.done"
@@ -6066,45 +6441,104 @@ def _excel_tool_stream_transform(source_body: dict):
                 continue
 
             if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                terminal_seen = True
                 response = payload.get("response")
                 response = response if isinstance(response, dict) else None
                 if response:
                     format_translation.normalize_response_reasoning_for_client(response)
-                tool_call = None
-                if event_type == "response.completed":
+                if event_type in {"response.failed", "response.incomplete"}:
+                    # Genuine upstream failures remain failures, but buffered
+                    # server tool calls must never escape to the client.
+                    held_events.clear()
+                    marker_mode = False
+                    for chunk in flush_text():
+                        yield chunk
+                    if response is not None and isinstance(response.get("output"), list):
+                        response = {**response, "output": [
+                            item for item in response["output"]
+                            if not isinstance(item, dict) or item.get("type")
+                            not in {"function_call", "custom_tool_call"}
+                        ]}
+                        payload = {**payload, "response": response}
+                    yield format_translation.sse_encode(event_type, payload)
+                    continue
+                response, tool_stream_issue = _reconcile_excel_tool_response(
+                    {**response_identity, **(response or {})}, observed_items,
+                    observed_tool_identities, native_events_seen,
+                )
+                final_calls = [item for item in response.get("output", [])
+                               if isinstance(item, dict) and item.get("type")
+                               in {"function_call", "custom_tool_call"}]
+                incomplete_tools = tool_stream_issue is not None
+                tool_calls = []
+                if event_type == "response.completed" and not incomplete_tools:
                     completed_text = full_text or (
                         format_translation.extract_response_output_text(response)
                         if response
                         else ""
                     )
-                    tool_call = excel_upstream.extract_client_tool_call(
-                        completed_text or "",
-                        allowed_tools,
-                    )
-                    if tool_call is None:
-                        tool_call = excel_upstream.extract_native_client_tool_call(
-                            response,
-                            source_body,
+                    if final_calls:
+                        tool_calls = excel_upstream.extract_native_client_tool_calls(response, source_body)
+                    else:
+                        tool_call = excel_upstream.extract_validated_client_tool_call(
+                            completed_text or "", source_body,
                         )
-                if tool_call is not None:
+                        tool_calls = [tool_call] if tool_call is not None else []
+                if not tool_calls and (final_calls or excel_upstream.client_tool_selection_issue(response, source_body)):
+                    corrected = await _retry_excel_tool_conversion(
+                        trace_plan, source_body, response, diagnostic_reason=tool_stream_issue,
+                    )
+                    if corrected is not None:
+                        prefix_count = len(response.get("output", [])) - len(final_calls)
+                        held_events.clear()
+                        emitted_upto = len(full_text)
+                        for chunk in _excel_corrected_response_event_bytes(corrected, source_body, prefix_count):
+                            yield chunk
+                        continue
+                if tool_calls:
                     held_events.clear()
                     emitted_upto = len(full_text)
-                    response_payload = excel_upstream.response_payload_with_tool_call(
-                        response,
-                        tool_call,
+                    response_payload = excel_upstream.response_payload_with_tool_calls(
+                        response, tool_calls,
                         model_id=excel_upstream.excel_model_id(source_body.get("model"))
                         or excel_upstream.MODEL_ID,
                     )
-                    tool_output_index = (
-                        native_tool_output_index
-                        if native_tool_output_index is not None
-                        else 0
+                    final_indexes = {
+                        item.get("call_id") or item.get("id"): index
+                        for index, item in enumerate(response_payload["output"])
+                        if item.get("type") in {"function_call", "custom_tool_call"}
+                    }
+                    for tool_call in tool_calls:
+                        key = tool_call.get("call_id") or tool_call.get("id")
+                        fallback_index = (
+                            native_tool_output_index
+                            if len(tool_calls) == 1 and native_tool_output_index is not None
+                            else final_indexes.get(key, 0)
+                        )
+                        tool_output_index = (final_indexes.get(key, fallback_index)
+                                             if len(tool_calls) != len(final_calls)
+                                             else native_tool_output_indexes.get(key, fallback_index))
+                        # Emit all items before the single terminal event.
+                        for chunk in _excel_tool_call_event_bytes(
+                            tool_call, response_payload, output_index=tool_output_index,
+                        )[:-1]:
+                            yield chunk
+                    yield format_translation.sse_encode(
+                        "response.completed",
+                        {"type": "response.completed", "response": response_payload},
                     )
-                    for chunk in _excel_tool_call_event_bytes(
-                        tool_call,
-                        response_payload,
-                        output_index=tool_output_index,
-                    ):
+                    continue
+                recovered_response = (
+                    _recoverable_excel_tool_response(
+                        response, source_body, trace_plan=trace_plan,
+                        diagnostic_reason=tool_stream_issue,
+                    )
+                    if event_type == "response.completed" else None
+                )
+                if recovered_response is not None:
+                    held_events.clear()
+                    emitted_upto = len(full_text)
+                    for chunk in _excel_tool_rejection_event_bytes(recovered_response):
                         yield chunk
                     continue
                 # Not a tool call after all: release everything that was held
@@ -6120,6 +6554,21 @@ def _excel_tool_stream_transform(source_body: dict):
 
             yield encoded
 
+        if native_events_seen and not terminal_seen:
+            # This is a genuine truncated upstream stream, not a formatting
+            # rejection. Report it honestly without leaking any pending call.
+            held_events.clear()
+            failure = {
+                **response_identity, "status": "failed", "output": [],
+                "error": {"code": "incomplete_upstream_stream",
+                          "message": "Upstream ended before a terminal response; no pending tool calls were dispatched."},
+            }
+            yield format_translation.sse_encode(
+                "response.failed", {"type": "response.failed", "response": failure},
+            )
+            if done_seen:
+                yield b'data: [DONE]\n\n'
+            return
         for chunk in flush_text():
             yield chunk
         for held in held_events:
@@ -6131,29 +6580,56 @@ def _excel_tool_stream_transform(source_body: dict):
 
 
 async def _read_excel_non_streaming_response_payload(
-    upstream: httpx.Response,
+    upstream: httpx.Response, *, client_body: dict | None = None,
+    trace_plan: UpstreamRequestPlan | None = None,
 ) -> dict | None:
-    completed_payload: dict | None = None
+    terminal_payload = None
+    observed_items = {}
+    identities = []
+    native_events_seen = False
     try:
-        async for event_name, data in format_translation.iter_sse_messages(
-            upstream.aiter_bytes()
-        ):
-            if not _is_response_completed_event(event_name, data):
+        async for event_name, data in format_translation.iter_sse_messages(upstream.aiter_bytes()):
+            if data == "[DONE]":
                 continue
             try:
-                parsed = json.loads(data or "")
+                event = json.loads(data)
             except json.JSONDecodeError:
                 continue
-            response_payload = parsed.get("response") if isinstance(parsed, dict) else None
-            if isinstance(response_payload, dict):
-                completed_payload = response_payload
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("type") or event_name or "").lower()
+            item = event.get("item")
+            if event_type in {"response.output_item.added", "response.output_item.done"} and isinstance(item, dict):
+                index = event.get("output_index")
+                if type(index) is int and index >= 0:
+                    observed_items[index] = dict(item)
+                if item.get("type") in {"function_call", "custom_tool_call"}:
+                    native_events_seen = True
+                    identities.append({key: item[key] for key in
+                        ("type", "id", "call_id", "name", "namespace") if key in item})
+            if event_type in {"response.function_call_arguments.delta", "response.function_call_arguments.done",
+                              "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done"}:
+                native_events_seen = True
+            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                payload = event.get("response")
+                if isinstance(payload, dict):
+                    terminal_payload = {**payload, "status": event_type.split(".", 1)[1]}
+                    if event_type == "response.completed":
+                        terminal_payload, issue = _reconcile_excel_tool_response(
+                            terminal_payload, observed_items, identities, native_events_seen,
+                        )
+                        if issue:
+                            corrected = await _retry_excel_tool_conversion(
+                                trace_plan, client_body or {}, terminal_payload, diagnostic_reason=issue,
+                            )
+                            terminal_payload = corrected if corrected is not None else _recoverable_excel_tool_response(
+                                terminal_payload, client_body or {}, trace_plan=trace_plan, diagnostic_reason=issue,
+                            )
+                    break
     except httpx.RemoteProtocolError:
-        # Basispoints sometimes emits a malformed final chunk after the
-        # complete response event. The completed Responses payload is still
-        # valid and is safe to return to a non-streaming caller.
-        if completed_payload is None:
+        if terminal_payload is None:
             raise
-    return completed_payload
+    return terminal_payload
 
 
 async def _post_excel_non_streaming_request(
@@ -6189,7 +6665,7 @@ async def _post_excel_non_streaming_request(
                     fallback_error_response=proxy_non_streaming_response,
                 )
             if "text/event-stream" in upstream.headers.get("content-type", "").lower():
-                response_payload = await _read_excel_non_streaming_response_payload(upstream)
+                response_payload = await _read_excel_non_streaming_response_payload(upstream, client_body=client_body, trace_plan=plan)
             else:
                 await upstream.aread()
                 response_payload = _extract_upstream_json_payload(upstream)
@@ -6216,26 +6692,49 @@ async def _post_excel_non_streaming_request(
         _finish_usage_and_trace(plan, 502, response_text=message)
         return format_translation.openai_error_response(502, message)
 
+    probe_metadata = client_body.get("metadata")
+    parallel_probe = isinstance(probe_metadata, dict) and probe_metadata.get("ghcp_native_parallel_probe") is True
+    original_native_count = sum(
+        isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call")
+        for item in (response_payload.get("output") if isinstance(response_payload.get("output"), list) else [])
+    ) if parallel_probe else 0
+    corrected = await _retry_excel_tool_conversion(plan, client_body, response_payload)
+    if corrected is not None:
+        response_payload = corrected
     translated_payload = dict(response_payload)
     translated_payload["model"] = excel_model_id
-    response_text = format_translation.extract_response_output_text(response_payload)
-    tool_call = excel_upstream.extract_client_tool_call(
-        response_text,
-        excel_upstream.client_tool_types(client_body),
-    )
-    if tool_call is None:
-        tool_call = excel_upstream.extract_native_client_tool_call(
-            response_payload,
-            client_body,
+    if response_payload.get("status") in {"failed", "incomplete"}:
+        # Never execute a partial tool call or convert an upstream failure to success.
+        if isinstance(translated_payload.get("output"), list):
+            translated_payload["output"] = [
+                item for item in translated_payload["output"]
+                if not isinstance(item, dict) or item.get("type")
+                not in {"function_call", "custom_tool_call"}
+            ]
+        format_translation.normalize_response_reasoning_for_client(translated_payload)
+    else:
+        response_text = format_translation.extract_response_output_text(response_payload)
+        has_native_calls = any(
+            isinstance(item, dict) and item.get("type") in {"function_call", "custom_tool_call"}
+            for item in response_payload.get("output") or []
         )
-    if tool_call is not None:
-        translated_payload = excel_upstream.response_payload_with_tool_call(
-            response_payload,
-            tool_call,
-            model_id=excel_model_id,
-        )
-        if isinstance(translated_payload, dict):
+        if has_native_calls:
+            tool_calls = excel_upstream.extract_native_client_tool_calls(response_payload, client_body)
+        else:
+            tool_call = excel_upstream.extract_validated_client_tool_call(response_text, client_body)
+            tool_calls = [tool_call] if tool_call is not None else []
+        if tool_calls:
+            translated_payload = excel_upstream.response_payload_with_tool_calls(
+                response_payload, tool_calls, model_id=excel_model_id,
+            )
             format_translation.normalize_response_reasoning_for_client(translated_payload)
+
+        else:
+            recovered_response = _recoverable_excel_tool_response(response_payload, client_body, trace_plan=plan)
+            if recovered_response is not None:
+                translated_payload = {**recovered_response, "model": excel_model_id}
+                format_translation.normalize_response_reasoning_for_client(translated_payload)
+
 
     _finish_usage_and_trace(
         plan,
@@ -6251,9 +6750,23 @@ async def _post_excel_non_streaming_request(
         ),
     )
     if isinstance(translated_payload, dict):
+        probe_headers = {}
+        if parallel_probe:
+            final_native_count = sum(
+                isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call")
+                for item in (response_payload.get("output") if isinstance(response_payload.get("output"), list) else [])
+            )
+            control = plan.body.get("parallel_tool_calls")
+            probe_headers = {
+                "x-ghcp-native-tool-call-count": str(final_native_count),
+                "x-ghcp-original-native-tool-call-count": str(original_native_count),
+                "x-ghcp-parallel-control": str(control).lower() if type(control) is bool else "absent",
+                "x-ghcp-request-id": plan.request_id,
+            }
         return JSONResponse(
             content=translated_payload,
             status_code=upstream.status_code,
+            headers=probe_headers,
         )
     return proxy_non_streaming_response(upstream)
 
@@ -6262,17 +6775,21 @@ class ExcelInlineImageUploadError(RuntimeError):
     pass
 
 
+class ExcelImageInputError(ExcelInlineImageUploadError):
+    pass
+
+
 def _decode_excel_inline_image(image_url: str) -> tuple[str, bytes]:
     if not isinstance(image_url, str) or not image_url.startswith("data:"):
-        raise ExcelInlineImageUploadError("Excel image input must use a data URL or HTTPS URL")
+        raise ExcelImageInputError("Excel image input must use a data URL or HTTPS URL")
     try:
         header, encoded = image_url.split(",", 1)
         media_type = header[5:].split(";", 1)[0] or "application/octet-stream"
-        raw = base64.b64decode(encoded, validate=True)
+        raw = base64.b64decode(''.join(encoded.split()), validate=True)
     except (ValueError, UnicodeError, base64.binascii.Error) as exc:
-        raise ExcelInlineImageUploadError("Excel image data URL is not valid base64") from exc
+        raise ExcelImageInputError("Excel image data URL is not valid base64") from exc
     if not raw:
-        raise ExcelInlineImageUploadError("Excel image data URL is empty")
+        raise ExcelImageInputError("Excel image data URL is empty")
     return media_type, raw
 
 
@@ -6346,10 +6863,11 @@ _excel_image_file_ids_lock = asyncio.Lock()
 
 def _excel_image_cache_key(image_url: str, excel_headers: dict[str, str]) -> str:
     lowered = {key.lower(): value for key, value in excel_headers.items()}
-    account = "|".join(
-        str(lowered.get(name) or "")
-        for name in ("chatgpt-account-id", "x-openai-account-user-id")
-    )
+    # File IDs are private to their BPS account and workspace.
+    account_id = lowered.get('x-openai-account-id') or lowered.get('chatgpt-account-id')
+    user_id = lowered.get('x-openai-account-user-id') or ''
+    scope = account_id or lowered.get('authorization') or ''
+    account = 'v2|' + json.dumps([scope, user_id], separators=(',', ':'))
     digest = hashlib.sha256()
     digest.update(account.encode("utf-8"))
     digest.update(b"\0")
@@ -6421,200 +6939,355 @@ async def _excel_file_id_for_image(
         return file_id
 
 
+def _normalize_excel_image_part(value: dict, path: str) -> dict:
+    '''Accept common image forms without changing text or image order.'''
+    part = dict(value)
+    part['type'] = 'input_image'
+    image_url = part.get('image_url')
+    if isinstance(image_url, dict):
+        if part.get('detail') is None and image_url.get('detail') is not None:
+            part['detail'] = image_url['detail']
+        image_url = image_url.get('url')
+        if not isinstance(image_url, str):
+            raise ExcelImageInputError(f'{path}: image_url.url must be a string')
+        part['image_url'] = image_url
+    fields = [key for key in ('image_url', 'file_id', 'image_base64') if part.get(key) is not None]
+    if len(fields) != 1:
+        raise ExcelImageInputError(f'{path}: each image needs exactly one of image_url, file_id or image_base64')
+    field = fields[0]
+    source = part[field]
+    if not isinstance(source, str) or not source.strip():
+        raise ExcelImageInputError(f'{path}: {field} must be a non-empty string')
+    if field == 'image_base64':
+        media_type = part.get('media_type')
+        if not isinstance(media_type, str) or not media_type.lower().startswith('image/'):
+            raise ExcelImageInputError(f'{path}: image_base64 requires an image/* media_type')
+        part['image_url'] = f'data:{media_type};base64,{source}'
+        part.pop('image_base64', None)
+        part.pop('media_type', None)
+    elif field == 'image_url':
+        image_url = source.strip()
+        if image_url.lower().startswith('data:'):
+            image_url = 'data:' + image_url[5:]
+        elif not image_url.startswith(('https://', 'http://')):
+            raise ExcelImageInputError(f'{path}: image_url must be a data URL or HTTP(S) URL')
+        part['image_url'] = image_url
+    else:
+        part['file_id'] = source.strip()
+    for key in ('image_url', 'file_id', 'detail'):
+        if part.get(key) is None:
+            part.pop(key, None)
+    if 'detail' in part and part['detail'] not in ('auto', 'low', 'high', 'original'):
+        raise ExcelImageInputError(f'{path}: detail must be auto, low, high or original')
+    return part
+
+
 async def _materialize_excel_inline_images(
     body: dict,
     excel_headers: dict[str, str],
 ) -> dict:
-    if not _request_headers_module.has_vision_input(body.get("input")):
+    if not _request_headers_module.has_vision_input(body.get('input')):
         return body
-
     rewritten = copy.deepcopy(body)
+    images: list[tuple[dict, str]] = []
 
-    async def visit(value):
+    def normalize(value, path, *, tool_output=False):
         if isinstance(value, list):
             for index, item in enumerate(value):
-                value[index] = await visit(item)
-            return value
-        if not isinstance(value, dict):
-            return value
-        if str(value.get("type", "")).lower() == "input_image":
-            image_url = value.get("image_url")
-            if isinstance(image_url, str) and image_url.startswith("data:"):
-                value.pop("image_url", None)
-                value["file_id"] = await _excel_file_id_for_image(
-                    image_url,
-                    excel_headers,
-                )
-            return value
-        for key, child in list(value.items()):
-            value[key] = await visit(child)
+                value[index] = normalize(item, f'{path}[{index}]', tool_output=tool_output)
+        elif isinstance(value, dict):
+            if str(value.get('type', '')).lower() == 'input_image':
+                value = _normalize_excel_image_part(value, path)
+                if not tool_output:
+                    images.append((value, path))
+            else:
+                # Do not interpret client tool schemas or metadata as images.
+                for key in ('content', 'output'):
+                    if isinstance(value.get(key), (list, dict)):
+                        value[key] = normalize(
+                            value[key], f'{path}.{key}',
+                            tool_output=tool_output or key == 'output',
+                        )
         return value
 
-    return await visit(rewritten)
+    rewritten['input'] = normalize(rewritten.get('input'), 'input')
+    # No image-count cap, truncation, reordering, or synthetic body text.
+    # Actual upstream context/image limits still apply. BPS accepts inline
+    # URLs in function_call_output images, but rejects file_id there (422).
+    # Upload user/message images only; preserve tool-result images inline.
+    for part, path in images:
+        image_url = part.get('image_url')
+        if isinstance(image_url, str) and image_url.startswith('data:'):
+            try:
+                file_id = await _excel_file_id_for_image(image_url, excel_headers)
+            except ExcelImageInputError as exc:
+                raise ExcelImageInputError(f'{path}: {exc}') from exc
+            part.pop('image_url')
+            part['file_id'] = file_id
+    return rewritten
 
 
-async def _handle_excel_responses(
-    request: Request,
-    body: dict,
-    *,
-    source_body: dict | None = None,
-) -> Response:
-    excel_model_id = (
-        excel_upstream.excel_model_id(body.get("model")) or excel_upstream.MODEL_ID
-    )
-    excel_session_capture.refresh_macos_excel_session(
-        excel_upstream.excel_session_store,
-        force=True,
-    )
-    excel_session_capture.refresh_windows_excel_session(
-        excel_upstream.excel_session_store,
-        force=True,
-    )
+def _bps_session_key(request: Request, body: dict) -> str:
+    lineage = excel_upstream._cache_key(body)
+    if not lineage:
+        lineage = request.headers.get('x-session-id') or request.headers.get('session_id')
+    if not lineage:
+        items = body.get('input')
+        root = next((i for i in items if isinstance(i, dict) and i.get('role') == 'user'), None) if isinstance(items, list) else items
+        lineage = hashlib.sha256(json.dumps(root, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    owner = hashlib.sha256(request.headers.get('authorization', '').encode()).hexdigest()
+    return owner + ':' + hashlib.sha256(str(lineage).encode()).hexdigest()
+
+
+def _bps_response_payload(response: Response):
     try:
-        excel_headers = excel_upstream.excel_session_store.request_headers(
-            stream=bool(body.get("stream")),
-        )
-        # The Basispoints Excel Responses route requires the vision feature
-        # header for input_image content. Codex sends images as standard
-        # Responses input_image blocks, so opt the session request into the
-        # vision path when the request actually contains one.
-        if _request_headers_module.has_vision_input(body.get("input")):
-            excel_headers["Copilot-Vision-Request"] = "true"
-    except RuntimeError as exc:
-        return format_translation.openai_error_response(401, str(exc))
-    try:
-        body_for_upstream = await _materialize_excel_inline_images(
-            body,
-            excel_headers,
-        )
-    except ExcelInlineImageUploadError as exc:
-        return format_translation.openai_error_response(502, str(exc))
+        value = json.loads(response.body)
+        return value if isinstance(value, dict) else None
+    except (AttributeError, ValueError, TypeError):
+        return None
 
+
+def _bps_effective_failure_status(status: int, payload: dict | None) -> int:
+    if status >= 400:
+        return status
+    if not isinstance(payload, dict):
+        return 502
+    outer = payload.get('response') if isinstance(payload.get('response'), dict) else payload
+    error = outer.get('error') if isinstance(outer.get('error'), dict) else outer
+    code = str(error.get('code') or error.get('type') or '').lower()
+    if any(word in code for word in ('quota', 'limit', 'credit', 'billing')):
+        return 429
+    if any(word in code for word in ('token', 'auth', 'credential')):
+        return 401
+    if code in {'forbidden', 'permission_denied'}:
+        return 403
+    return 502
+
+
+async def _close_bps_stream(iterator):
+    close = getattr(iterator, 'aclose', None)
+    if callable(close):
+        await close()
+
+
+async def _bps_preflight_stream(response: Response):
+    """Hold only handshake events: a pre-output SSE failure can change accounts."""
+    import codecs
+    iterator = response.body_iterator.__aiter__()
+    buffered = []
+    decoder = codecs.getincrementaldecoder('utf-8')()
+    pending = ''
+    size = 0
+    deadline = time.monotonic() + configured_upstream_timeout_seconds()
+    release = False
+    try:
+        while not release and size < 262144:
+            try:
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=max(0.1, deadline - time.monotonic()))
+            except StopAsyncIteration:
+                break
+            buffered.append(chunk)
+            size += len(chunk)
+            pending += decoder.decode(chunk) if isinstance(chunk, bytes) else str(chunk)
+            pending = pending.replace(chr(13) + chr(10), chr(10))
+            while chr(10) * 2 in pending:
+                block, pending = pending.split(chr(10) * 2, 1)
+                data = chr(10).join(line[5:].lstrip() for line in block.splitlines() if line.startswith('data:'))
+                if not data or data == '[DONE]':
+                    continue
+                try:
+                    event = json.loads(data)
+                except ValueError:
+                    release = True
+                    break
+                if not isinstance(event, dict):
+                    release = True
+                    break
+                kind = event.get('type', '')
+                if kind in {'error', 'response.failed', 'response.incomplete', 'response.completed'}:
+                    if bps_failover.should_failover(200, event):
+                        await _close_bps_stream(iterator)
+                        return event
+                    release = True
+                    break
+                if kind in {'response.output_text.delta', 'response.output_text.done',
+                            'response.function_call_arguments.delta', 'response.function_call_arguments.done',
+                            'response.custom_tool_call_input.delta', 'response.custom_tool_call_input.done',
+                            'response.reasoning_summary_text.delta', 'response.reasoning_text.delta', 'response.refusal.delta'}:
+                    release = True
+                    break
+                item = event.get('item')
+                if kind in {'response.output_item.added', 'response.output_item.done'} and isinstance(item, dict):
+                    if item.get('type') in {'function_call', 'custom_tool_call'} or item.get('content'):
+                        release = True
+                        break
+        async def replay():
+            try:
+                for chunk in buffered:
+                    yield chunk
+                async for chunk in iterator:
+                    yield chunk
+            finally:
+                await _close_bps_stream(iterator)
+        response.body_iterator = replay()
+        return None
+    except BaseException:
+        await _close_bps_stream(iterator)
+        raise
+
+
+async def _bps_observe_stream_result(iterator, pool, selection):
+    """Remember a late stream failure for the NEXT turn; never replay this turn."""
+    import codecs
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    pending = ''
+    noted = False
+    try:
+        async for chunk in iterator:
+            pending += decoder.decode(chunk) if isinstance(chunk, bytes) else str(chunk)
+            pending = pending.replace(chr(13) + chr(10), chr(10))
+            while chr(10) * 2 in pending:
+                block, pending = pending.split(chr(10) * 2, 1)
+                data = chr(10).join(line[5:].lstrip() for line in block.splitlines() if line.startswith('data:'))
+                try:
+                    event = json.loads(data)
+                except (ValueError, TypeError):
+                    continue
+                if (not noted and isinstance(event, dict)
+                        and event.get('type') in {'error', 'response.failed', 'response.incomplete', 'response.completed'}
+                        and bps_failover.should_failover(200, event)):
+                    noted = True
+                    try:
+                        await asyncio.to_thread(pool.record_result, selection.credential_id,
+                                                _bps_effective_failure_status(200, event),
+                                                expected_revision=selection.revision)
+                    except bps_credentials.PoolError:
+                        pass
+            if len(pending) > 1048576:
+                pending = ''  # Bound diagnostic buffering; forward the original bytes unchanged.
+            yield chunk
+    finally:
+        await _close_bps_stream(iterator)
+
+
+async def _send_excel_credential_attempt(request, body, body_with_attachments, selection, source_body=None, *, is_compact=False):
+    excel_model_id = excel_upstream.excel_model_id(body.get('model')) or excel_upstream.MODEL_ID
+    portable = (bps_failover.prepare_failover_body(body_with_attachments)
+                if selection.switched else body_with_attachments)
+    if is_compact:
+        # Validate/recover the ORIGINAL transcript before compaction sanitizes it.
+        # Otherwise opaque account-bound context could disappear before a retry.
+        portable = format_translation.build_fake_compaction_request(portable)
+    excel_headers = dict(selection.headers)
+    if _request_headers_module.has_vision_input(portable.get('input')):
+        excel_headers['Copilot-Vision-Request'] = 'true'
+    body_for_upstream = await _materialize_excel_inline_images(portable, excel_headers)
     upstream_body = excel_upstream.prepare_responses_body(
-        body_for_upstream,
-        tools_version_id=excel_upstream.excel_session_store.tools_version_id(),
+        body_for_upstream, tools_version_id=selection.tools_version_id,
     )
-
     plan, error_response = _prepare_upstream_request(
-        request,
-        body=upstream_body,
-        requested_model=excel_model_id,
-        resolved_model=excel_model_id,
-        upstream_path="/basispoints/api/responses",
-        upstream_url=excel_upstream.RESPONSES_URL,
+        request, body=upstream_body, requested_model=excel_model_id, resolved_model=excel_model_id,
+        upstream_path='/basispoints/api/responses', upstream_url=excel_upstream.RESPONSES_URL,
         header_builder=lambda _api_key, _request_id: dict(excel_headers),
-        error_response=format_translation.openai_error_response,
-        api_key="excel-session",
+        error_response=format_translation.openai_error_response, api_key='excel-session',
         source_body=source_body if isinstance(source_body, dict) else body,
-        trace_metadata={
-            "bridge": True,
-            "strategy_name": "responses_to_excel_responses",
-            "caller_protocol": "responses",
-            "upstream_protocol": "responses",
-            "header_kind": "excel-session",
-        },
+        trace_metadata={'bridge': True, 'strategy_name': 'responses_to_excel_responses',
+                        'caller_protocol': 'responses', 'upstream_protocol': 'responses',
+                        'header_kind': 'excel-session', 'credential_id': selection.credential_id},
     )
     if error_response is not None:
         return error_response
-    if bool(upstream_body.get("stream")):
+    if bool(upstream_body.get('stream')):
         return await proxy_streaming_response(
-            plan.upstream_url,
-            plan.headers,
-            plan.body,
-            timeout=300,
-            usage_event=plan.usage_event,
-            stream_type="responses",
-            trace_plan=plan,
-            downstream_request=request,
-            caller_protocol="responses",
-            caller_model=excel_model_id,
-            stream_transform=_excel_tool_stream_transform(body),
-            sync_replay_ids=False,
-            upstream_client=_get_excel_upstream_client(),
+            plan.upstream_url, plan.headers, plan.body, timeout=300,
+            usage_event=plan.usage_event, stream_type='responses', trace_plan=plan,
+            downstream_request=request, caller_protocol='responses', caller_model=excel_model_id,
+            stream_transform=_excel_tool_stream_transform(body, trace_plan=plan),
+            sync_replay_ids=False, upstream_client=_get_excel_upstream_client(),
         )
     return await _post_excel_non_streaming_request(plan, client_body=body)
 
 
-async def _handle_copilot_sdk_responses(
-    request: Request,
-    body: dict,
-    *,
-    source_body: dict | None = None,
-    is_compact: bool = False,
-) -> Response:
-    effective_subagent = _responses_effective_subagent(request, body)
-    approval_agent = is_approval_agent_request(
-        subagent=effective_subagent,
-        inbound_protocol="responses",
-        body=body if isinstance(body, dict) else None,
-    )
-    requested_model = body.get("model")
-    mapped_model = None
-    if approval_agent:
-        mapped_model = model_routing_config_service.resolve_approval_target_model(requested_model)
-    if mapped_model is None:
-        mapped_model = model_routing_config_service.resolve_target_model(requested_model)
-    resolved_model = normalize_routing_model_name(mapped_model or requested_model)
+async def _handle_excel_responses(request: Request, body: dict, *, source_body: dict | None = None,
+                                  credential_id: str | None = None,
+                                  compaction_source: dict | None = None) -> Response:
+    try:
+        excel_upstream.validate_client_tool_choice(body)
+        if isinstance(body.get('input'), list):
+            excel_upstream.client_tool_batch.collapse_history(body['input'], excel_upstream._remembered_native_call)
+    except ValueError as exc:
+        return format_translation.openai_error_response(400, str(exc))
+    def resolve_attachment(file_id):
+        record = _attachment_store.get(file_id, file_owner_scope(request))
+        return {'filename': record['filename'], 'data': record['data']}
+    try:
+        materialized = await asyncio.to_thread(attachment_inputs.materialize_input_files,
+            compaction_source if compaction_source is not None else body, resolve_file=resolve_attachment)
+    except attachment_inputs.AttachmentInputError as exc:
+        return format_translation.openai_error_response(400, str(exc))
+    except FileStoreError as exc:
+        return format_translation.openai_error_response(exc.status_code, str(exc))
+    pool = bps_credentials.credential_pool
+    try:
+        await asyncio.to_thread(pool.migrate_legacy, excel_upstream.excel_session_store, openai_oauth.login_service)
+    except bps_credentials.PoolError as exc:
+        return format_translation.openai_error_response(exc.status_code, str(exc))
+    session_key = _bps_session_key(request, body)
+    excluded = set()
+    last_response = None
+    for attempt in range(1 if credential_id is not None else 3):
+        try:
+            selected = await asyncio.to_thread(pool.acquire, session_key, stream=bool(body.get('stream')),
+                                              credential_id=credential_id, exclude_ids=excluded)
+        except bps_credentials.PoolError as exc:
+            return last_response if last_response is not None else format_translation.openai_error_response(exc.status_code, str(exc))
+        excluded.add(selected.credential_id)
+        failure = None
+        try:
+            result = await _send_excel_credential_attempt(request, body, materialized, selected, source_body,
+                is_compact=compaction_source is not None)
+            if isinstance(result, StreamingResponse) and result.status_code < 400:
+                failure = await _bps_preflight_stream(result)
+                if failure is not None:
+                    result = format_translation.openai_error_response(_bps_effective_failure_status(200, failure),
+                        '当前凭证暂不可用（认证、额度或上游故障）。')
+        except bps_failover.FailoverReplayError:
+            return format_translation.openai_error_response(409,
+                '凭证需要切换，但当前历史含仅原账号可用的压缩上下文或附件。请使用完整本地历史重试，或新建会话并重新上传附件；未静默丢弃上下文。')
+        except ExcelImageInputError as exc:
+            return format_translation.openai_error_response(400, str(exc))
+        except ExcelInlineImageUploadError:
+            result = format_translation.openai_error_response(502, '当前凭证上传图片失败；请检查账号或代理。')
+        except (httpx.HTTPError, asyncio.TimeoutError, OSError):
+            result = format_translation.openai_error_response(502, 'BPS 请求未能完成，请检查网络、代理及账号状态。')
+        except ValueError as exc:
+            return format_translation.openai_error_response(400, str(exc))
+        payload = failure or _bps_response_payload(result)
+        retry = bps_failover.should_failover(result.status_code, payload)
+        status = _bps_effective_failure_status(result.status_code, payload) if retry else result.status_code
+        try:
+            await asyncio.to_thread(pool.record_result, selected.credential_id, status,
+                                    retry_after=result.headers.get('retry-after'),
+                                    expected_revision=selected.revision)
+        except bps_credentials.PoolError:
+            pass  # Administrative persistence failure must not replay a completed generation.
+        result.headers['x-ghcp-credential-id'] = selected.credential_id
+        result.headers['x-ghcp-credential-attempt'] = str(attempt + 1)
+        result.headers['x-ghcp-credential-revision'] = str(selected.revision)
+        if not retry or credential_id is not None:
+            if isinstance(result, StreamingResponse) and result.status_code < 400:
+                result.body_iterator = _bps_observe_stream_result(result.body_iterator, pool, selected)
+            return result
+        _append_request_trace({'event': 'bps_credential_failover', 'time': util.utc_now_iso(),
+                               'credential_id': selected.credential_id, 'attempt': attempt + 1,
+                               'status_code': status})
+        last_response = result
+    return last_response
 
-    sdk_body = dict(body)
-    sdk_body["model"] = resolved_model
-    if approval_agent and resolved_model and resolved_model.startswith("gpt-5.6-luna"):
-        sdk_body["reasoning_effort"] = "high"
-        reasoning = sdk_body.get("reasoning")
-        sdk_body["reasoning"] = (
-            {**reasoning, "effort": "high"}
-            if isinstance(reasoning, dict)
-            else {"effort": "high"}
-        )
-    # A compaction turn keeps the caller's tool_choice.  tool_choice "none"
-    # here would unregister the session's tools, which changes the start of
-    # the prompt and misses the cache for the whole context; the SDK adapter
-    # sets tool_choice "none" on the turn's model calls instead.
 
-    raw_input = sdk_body.get("input")
-    has_compaction_input = format_translation.input_contains_compaction(raw_input)
-    if raw_input is not None:
-        sdk_body["input"] = format_translation.sanitize_input(
-            raw_input,
-            native_responses_passthrough=False,
-        )
 
-    upstream_path = "/v1/responses/compact" if is_compact else "/v1/responses"
-    upstream_url = f"copilot-sdk://responses{'/compact' if is_compact else ''}"
-    plan, error_response = _prepare_upstream_request(
-        request,
-        body=sdk_body,
-        requested_model=requested_model,
-        resolved_model=resolved_model,
-        upstream_path=upstream_path,
-        upstream_url=upstream_url,
-        header_builder=lambda _api_key, _request_id: dict(request.headers),
-        error_response=format_translation.openai_error_response,
-        api_key="copilot-sdk",
-        source_body=source_body if isinstance(source_body, dict) else body,
-        force_initiator="agent" if (has_compaction_input or is_compact) else None,
-        trace_metadata={
-            "sdk": True,
-            "strategy_name": "copilot_sdk_compact" if is_compact else "copilot_sdk_responses",
-            "caller_protocol": "responses",
-            "upstream_protocol": "sdk",
-            "upstream_body_representation": "sdk_adapter_input_not_model_wire",
-            "subagent": effective_subagent,
-            "approval_agent": approval_agent,
-            "is_compact": is_compact,
-        },
-    )
-    if error_response is not None:
-        return error_response
-
-    return await copilot_sdk_upstream.handle_responses(
-        request,
-        sdk_body,
-        plan=plan,
-        is_compact=is_compact,
-        finish_usage_callback=_finish_usage_and_trace,
-        mark_first_output_callback=(lambda: usage_tracker.mark_first_output(plan.usage_event)) if plan else None,
-    )
+async def _handle_copilot_sdk_responses(request: Request, body: dict, *, source_body=None, is_compact=False):
+    return format_translation.openai_error_response(501, "Copilot SDK 已禁用，请使用 BPS Responses。")
 
 
 @app.post("/responses")
@@ -6622,106 +7295,16 @@ async def _handle_copilot_sdk_responses(
 async def responses(request: Request):
     try:
         body = await parse_json_request(request)
+        if body.get("model") is not None and not isinstance(body["model"], str):
+            raise HTTPException(status_code=400, detail="model must be a string.")
     except HTTPException as exc:
-        return format_translation.openai_error_response(
-            exc.status_code,
-            format_translation.http_exception_detail_to_message(exc.detail),
-        )
-
-    agent_compat_diagnostics: list[dict] = []
-    body = codex_agent_compat.normalize_codex_agent_tools(
-        body,
-        diagnostics=agent_compat_diagnostics,
-    )
-    if excel_upstream.is_excel_model(body.get("model")):
-        return await _handle_excel_responses(request, body)
-    if copilot_sdk_upstream.enabled():
-        if copilot_sdk_upstream.is_compaction_request(body):
-            return await _handle_copilot_sdk_responses(
-                request,
-                format_translation.build_fake_compaction_request(body),
-                source_body=body,
-                is_compact=True,
-            )
-        return await _handle_copilot_sdk_responses(request, body)
-
-    effective_subagent = _responses_effective_subagent(request, body)
-
-    raw_input = body.get("input")
-    has_compaction_input = format_translation.input_contains_compaction(raw_input)
-    native_responses_passthrough = _responses_route_uses_native_responses_passthrough(body)
-    encrypted_reasoning_strip_reason = _encrypted_reasoning_strip_reason_for_responses_context(
-        request, raw_input, body
-    )
-    drop_reasoning_items = encrypted_reasoning_strip_reason is not None
-    input_sanitization_trace = None
-    if raw_input is not None:
-        body["input"] = format_translation.sanitize_input(
-            raw_input,
-            preserve_encrypted_content=encrypted_reasoning_strip_reason is None,
-            drop_reasoning_items=drop_reasoning_items,
-            native_responses_passthrough=native_responses_passthrough,
-        )
-        input_sanitization_trace = _responses_input_sanitization_trace(
-            raw_input,
-            body.get("input"),
-            encrypted_reasoning_strip_reason=encrypted_reasoning_strip_reason,
-            dropped_reasoning_items=drop_reasoning_items,
-        )
-
-    replay_id_repair_trace = None
-    if native_responses_passthrough:
-        replay_subagent = _responses_effective_subagent(request, body)
-        body, replay_id_repair_trace = responses_replay_ids.repair_missing_replay_ids(
-            body,
-            headers=request.headers,
-            subagent=replay_subagent,
-        )
-
-    try:
-        api_key = auth.get_api_key()
-    except Exception:
-        return format_translation.openai_error_response(401, AUTH_FAILURE_MESSAGE)
-
-    api_base = auth.get_api_base()
-    try:
-        bridge_plan = await bridge_planner.plan(
-            "responses",
-            body,
-            api_base=api_base,
-            api_key=api_key,
-            subagent=effective_subagent,
-        )
-    except ValueError:
-        return format_translation.openai_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
-
-    trace_metadata_extra = {}
-    if input_sanitization_trace is not None:
-        trace_metadata_extra["responses_input_sanitization"] = input_sanitization_trace
-    if replay_id_repair_trace is not None:
-        trace_metadata_extra["responses_replay_id_repair"] = replay_id_repair_trace
-    if agent_compat_diagnostics:
-        trace_metadata_extra["codex_agent_compat"] = agent_compat_diagnostics
-
-    plan, error_response = _prepare_bridge_request(
-        request,
-        original_body=body,
-        bridge_plan=bridge_plan,
-        api_base=api_base,
-        api_key=api_key,
-        force_initiator="agent" if has_compaction_input else None,
-        trace_metadata_extra=trace_metadata_extra or None,
-    )
-    if error_response is not None:
-        return error_response
-
-    if bridge_plan.stream:
-        return await _proxy_bridge_streaming_response(
-            plan,
-            bridge_plan,
-            downstream_request=request,
-        )
-    return await _post_bridge_non_streaming_request(plan, bridge_plan)
+        return format_translation.openai_error_response(exc.status_code,
+            format_translation.http_exception_detail_to_message(exc.detail))
+    body = codex_agent_compat.normalize_codex_agent_tools(body, diagnostics=[])
+    # Only configured BPS routes are honored. Unknown/removed aliases use Astra;
+    # there is deliberately no Copilot/SDK/network discovery fallback.
+    target = model_routing_config_service.resolve_bps_model(body.get("model")) or "gpt-6-astra-excel"
+    return await _handle_excel_responses(request, {**body, "model": target}, source_body=body)
 
 
 @app.post("/responses/compact")
@@ -6729,72 +7312,23 @@ async def responses(request: Request):
 async def responses_compact(request: Request):
     try:
         body = await parse_json_request(request)
+        if body.get("model") is not None and not isinstance(body["model"], str):
+            raise HTTPException(status_code=400, detail="model must be a string.")
     except HTTPException as exc:
-        return format_translation.openai_error_response(
-            exc.status_code,
-            format_translation.http_exception_detail_to_message(exc.detail),
-        )
-
-    requested_excel = excel_upstream.is_excel_model(body.get("model"))
-    resolved_target = model_routing_config_service.resolve_target_model(body.get("model"))
-    force_responses_safe_transcript = (
-        isinstance(resolved_target, str)
-        and model_provider_family(resolved_target) not in (None, "codex")
-    )
-    summary_request = format_translation.build_fake_compaction_request(
-        body,
-        force_responses_safe_transcript=force_responses_safe_transcript,
-    )
-    if requested_excel:
-        return await _handle_excel_responses(
-            request,
-            summary_request,
-            source_body=body,
-        )
-    if copilot_sdk_upstream.enabled():
-        return await _handle_copilot_sdk_responses(
-            request,
-            summary_request,
-            source_body=body,
-            is_compact=True,
-        )
-
-    try:
-        api_key = auth.get_api_key()
-    except Exception:
-        return format_translation.openai_error_response(401, AUTH_FAILURE_MESSAGE)
-
-    api_base = auth.get_api_base()
-    try:
-        bridge_plan = await bridge_planner.plan(
-            "responses",
-            summary_request,
-            api_base=api_base,
-            api_key=api_key,
-            subagent=request.headers.get("x-openai-subagent"),
-            is_compact=True,
-        )
-    except ValueError:
-        return format_translation.openai_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
-
-    plan, error_response = _prepare_bridge_request(
-        request,
-        original_body=summary_request,
-        bridge_plan=bridge_plan,
-        api_base=api_base,
-        api_key=api_key,
-        force_initiator="agent",
-    )
-    if error_response is not None:
-        return error_response
-
-    if bridge_plan.stream:
-        return await _proxy_bridge_streaming_response(
-            plan,
-            bridge_plan,
-            downstream_request=request,
-        )
-    return await _post_bridge_non_streaming_request(plan, bridge_plan)
+        return format_translation.openai_error_response(exc.status_code,
+            format_translation.http_exception_detail_to_message(exc.detail))
+    original_body = body
+    target = model_routing_config_service.resolve_bps_model(body.get("model")) or "gpt-6-astra-excel"
+    body = {**body, "model": target}
+    summary_request = format_translation.build_fake_compaction_request(body, force_responses_safe_transcript=False)
+    result = await _handle_excel_responses(request, summary_request, source_body=original_body, compaction_source=body)
+    if isinstance(result, JSONResponse) and result.status_code < 400:
+        payload = json.loads(result.body)
+        if isinstance(payload, dict) and payload.get("status") not in {"failed", "incomplete"} and not payload.get("error"):
+            compact = format_translation.responses_to_compaction_response(payload, fallback_model=body.get("model"))
+            headers = {key: value for key, value in result.headers.items() if key.lower() not in {"content-length", "content-type"}}
+            return JSONResponse(compact, status_code=result.status_code, headers=headers)
+    return result
 
 
 # ─── Route: /v1/chat/completions  (non-Codex models) ─────────────────────────
@@ -6802,117 +7336,20 @@ async def responses_compact(request: Request):
 @app.post("/chat/completions")
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """
-    For models that still use the Chat API.
-    Codex does NOT use this endpoint — it uses /v1/responses above.
-    """
-    try:
-        body = await parse_json_request(request)
-    except HTTPException as exc:
-        return format_translation.openai_error_response(
-            exc.status_code,
-            format_translation.http_exception_detail_to_message(exc.detail),
-        )
-
-    messages = body.get("messages", [])
-
-    upstream_url = f"{auth.get_api_base().rstrip('/')}/chat/completions"
-    verdict_sink: dict = {}
-    plan, error_response = _prepare_upstream_request(
-        request,
-        body=body,
-        requested_model=body.get("model"),
-        resolved_model=body.get("model"),
-        upstream_path="/chat/completions",
-        upstream_url=upstream_url,
-        header_builder=lambda api_key, request_id: format_translation.build_chat_headers_for_request(
-            request,
-            messages,
-            body.get("model"),
-            api_key,
-            request_id=request_id,
-            initiator_policy=_initiator_policy,
-            session_id_resolver=usage_tracking.request_session_id,
-            verdict_sink=verdict_sink,
-            affinity_body=body,
-        ),
-        error_response=format_translation.openai_error_response,
-        trace_metadata={"initiator_verdict": verdict_sink},
-    )
-    if error_response is not None:
-        return error_response
-
-    if body.get("stream", False):
-        return await proxy_streaming_response(
-            plan.upstream_url,
-            plan.headers,
-            plan.body,
-            timeout=300,
-            usage_event=plan.usage_event,
-            stream_type="chat",
-            trace_plan=plan,
-            downstream_request=request,
-        )
-    return await _post_non_streaming_request(plan, error_response=format_translation.openai_error_response)
+    return format_translation.openai_error_response(501,
+        "Copilot 已禁用；当前仅支持 BPS Responses 协议，请使用 /v1/responses。")
 
 
 @app.get("/models")
 @app.get("/v1/models")
 async def models():
-    if copilot_sdk_upstream.enabled():
-        return await copilot_sdk_upstream.models_response()
-    return await _proxy_models_request()
+    return JSONResponse(content=excel_upstream.merge_local_models_payload({}))
 
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
-    """
-    Anthropic-compatible route.
-    Translate Anthropic Messages payloads onto GHCP's OpenAI-compatible chat
-    endpoint so Claude Code can reuse Copilot's cache semantics.
-    """
-    try:
-        body = await parse_json_request(request)
-    except HTTPException as exc:
-        return format_translation.anthropic_error_response(
-            exc.status_code,
-            format_translation.http_exception_detail_to_message(exc.detail),
-        )
-
-    try:
-        api_key = auth.get_api_key()
-    except Exception:
-        return format_translation.anthropic_error_response(401, AUTH_FAILURE_MESSAGE)
-
-    api_base = auth.get_api_base()
-    try:
-        bridge_plan = await bridge_planner.plan(
-            "messages",
-            body,
-            api_base=api_base,
-            api_key=api_key,
-            subagent=request.headers.get("x-openai-subagent"),
-        )
-    except ValueError:
-        return format_translation.anthropic_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
-
-    plan, error_response = _prepare_bridge_request(
-        request,
-        original_body=body,
-        bridge_plan=bridge_plan,
-        api_base=api_base,
-        api_key=api_key,
-    )
-    if error_response is not None:
-        return error_response
-
-    if bridge_plan.stream:
-        return await _proxy_bridge_streaming_response(
-            plan,
-            bridge_plan,
-            downstream_request=request,
-        )
-    return await _post_bridge_non_streaming_request(plan, bridge_plan)
+    return format_translation.anthropic_error_response(501,
+        "Copilot 已禁用；当前仅支持 BPS Responses 协议，请使用 /v1/responses。")
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
@@ -6954,29 +7391,32 @@ if __name__ == "__main__":
     # fails, so a duplicate launch would revert the client configs that the
     # already-running instance owns. Bail out before touching any of that.
     if _proxy_port_in_use():
-        print("GHCP proxy is already running on http://127.0.0.1:8000; exiting.", flush=True)
+        print(f"GHCP proxy is already running on {PROXY_BASE_URL}; exiting.", flush=True)
         sys.exit(0)
 
     # Start the server immediately so first-run setup can complete from the
     # browser dashboard instead of blocking on a terminal prompt.
-    print("Starting GHCP proxy on http://127.0.0.1:8000 (loopback only)", flush=True)
+    print(f"Starting GHCP proxy on {PROXY_BASE_URL} (loopback only)", flush=True)
     print("  Responses API : POST /v1/responses", flush=True)
-    print(f"  Codex upstream: {copilot_sdk_upstream.responses_upstream()}", flush=True)
+    print("  Codex upstream: BPS only (unknown models -> gpt-6-astra-excel)", flush=True)
     print("  Compaction    : POST /v1/responses/compact", flush=True)
-    print("  Chat API      : POST /v1/chat/completions", flush=True)
+    print("  Copilot       : disabled (Chat/Messages legacy routes return 501)", flush=True)
     print("  Dashboard     : GET  /ui", flush=True)
     print("", flush=True)
-    print("  If this is a fresh setup, open /ui and complete GitHub sign-in there.", flush=True)
+    print("  Open /ui to sign in with ChatGPT (BPS). Copilot is disabled.", flush=True)
     print("", flush=True)
     print("  Set in your shell:", flush=True)
-    print("    export OPENAI_BASE_URL=http://127.0.0.1:8000/v1", flush=True)
+    print(f"    export OPENAI_BASE_URL={CODEX_PROXY_BASE_URL}", flush=True)
     print("    export OPENAI_API_KEY=anything", flush=True)
     print("", flush=True)
 
     _write_proxy_pid_file()
     atexit.register(_remove_proxy_pid_file)
     try:
-        uvicorn.run(app, host="127.0.0.1", port=8000, access_log=False, timeout_graceful_shutdown=2)
+        _DESKTOP_SERVER = uvicorn.Server(uvicorn.Config(
+            app, host="127.0.0.1", port=PROXY_PORT, access_log=False, timeout_graceful_shutdown=2,
+        ))
+        _DESKTOP_SERVER.run()
     finally:
         revert_client_proxy_configs_on_shutdown()
         _remove_proxy_pid_file()

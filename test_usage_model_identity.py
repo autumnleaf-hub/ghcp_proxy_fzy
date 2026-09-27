@@ -7,13 +7,16 @@ from util import _usage_event_model_name
 class UsageModelIdentityTests(unittest.TestCase):
     def test_excel_alias_wins_over_base_response_model(self):
         for base_model in (
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.6-luna",
             "gpt-5.6-terra",
             "gpt-5.6-sol",
         ):
             excel_model = f"{base_model}-excel"
             event = {
-                "requested_model": excel_model,
+                "requested_model": base_model,
                 "resolved_model": excel_model,
                 "response_model": base_model,
                 "finished_at": "2026-09-17T12:00:00Z",
@@ -23,6 +26,13 @@ class UsageModelIdentityTests(unittest.TestCase):
             with self.subTest(excel_model=excel_model):
                 self.assertEqual(_usage_event_model_name(event), excel_model)
                 self.assertEqual(_prepare_usage_event(event)["model_name"], excel_model)
+
+    def test_new_excel_models_reuse_base_rates_with_credit_accounting(self):
+        from constants import MODEL_PRICING
+
+        for base in ("gpt-6-sol", "gpt-6-luna"):
+            expected = {**MODEL_PRICING[base], "provider": "OpenAI Excel", "credit_unit_usd": 0.04}
+            self.assertEqual(MODEL_PRICING[base + "-excel"], expected)
 
     def test_non_credit_model_keeps_response_model_precedence(self):
         event = {

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 
-APP_DIR_NAME = "ghcp_proxy"
+APP_DIR_NAME = os.environ.get("GHCP_APP_DIR_NAME", "ghcp_proxy_fzy")
 
 
 def _env_path(name: str) -> str | None:

@@ -24,15 +24,27 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from app_paths import user_state_dir
 import responses_replay_ids
+import client_tool_transport
+import client_tool_batch
+from tool_schema_validation import matches_schema as _value_matches_schema
 
 
 EXCEL_MODEL_UPSTREAMS = {
     "gpt-6-astra-excel": "gpt-6-astra",
+    "gpt-6-sol-excel": "gpt-6-sol",
+    "gpt-6-luna-excel": "gpt-6-luna",
     "gpt-5.6-luna-excel": "gpt-5.6-luna",
     "gpt-5.6-terra-excel": "gpt-5.6-terra",
     "gpt-5.6-sol-excel": "gpt-5.6-sol",
 }
+# Keep suffixed IDs internally for routing and OpenAI Credit accounting.
+# Accept base names, legacy Excel aliases, and Codex BasisPoints names.
+EXCEL_MODEL_ALIASES = {base: alias for alias, base in EXCEL_MODEL_UPSTREAMS.items()}
+BASISPOINTS_MODEL_ALIASES = {
+    f'{base}-basispoints': alias for base, alias in EXCEL_MODEL_ALIASES.items()
+}
 MODEL_IDS = tuple(EXCEL_MODEL_UPSTREAMS)
+PUBLIC_MODEL_IDS = (*EXCEL_MODEL_ALIASES, *MODEL_IDS, *BASISPOINTS_MODEL_ALIASES)
 MODEL_ID = "gpt-5.6-sol-excel"
 _UPSTREAM_MODEL_OVERRIDE = os.environ.get("GHCP_EXCEL_UPSTREAM_MODEL", "").strip()
 UPSTREAM_MODEL = _UPSTREAM_MODEL_OVERRIDE or EXCEL_MODEL_UPSTREAMS[MODEL_ID]
@@ -73,7 +85,6 @@ _TOOL_CALL_PATTERN = re.compile(
     + re.escape(TOOL_CALL_MARKER_CLOSE),
     re.DOTALL,
 )
-_JSON_ESCAPE_CHARS = frozenset('\"\\/bfnrt')
 _TRANSPORT_RETRY_GUIDANCE = (
     "The previous run_officejs relay was rejected because its transport envelope was malformed. "
     "Retry once with exactly one outer run_officejs call. Its code field is JSON text, not "
@@ -158,6 +169,8 @@ LOCAL_MODEL_CAPABILITIES = {
         "context_window": 200_000 if "luna" in model_id else 272_000,
         "display_name": {
             "gpt-6-astra-excel": "6-Astra Excel",
+            "gpt-6-sol-excel": "6-Sol Excel",
+            "gpt-6-luna-excel": "6-Luna Excel",
             "gpt-5.6-luna-excel": "5.6-Luna Excel",
             "gpt-5.6-terra-excel": "5.6-Terra Excel",
             "gpt-5.6-sol-excel": "5.6-Sol Excel",
@@ -166,7 +179,7 @@ LOCAL_MODEL_CAPABILITIES = {
         "max_context_window": 200_000 if "luna" in model_id else 272_000,
         "messages_endpoint_supported": False,
         "model_picker_enabled": True,
-        "parallel_tool_calls": False,
+        "parallel_tool_calls": True,
         "provider": "OpenAI Excel",
         "reasoning_efforts": list(
             EXCEL_MODEL_REASONING_EFFORTS.get(model_id, EXCEL_REASONING_EFFORTS)
@@ -186,6 +199,10 @@ def excel_model_id(model: object) -> str | None:
     if not isinstance(model, str):
         return None
     normalized = model.strip().lower()
+    if normalized.startswith("openai/"):
+        normalized = normalized.split("/", 1)[1]
+    normalized = EXCEL_MODEL_ALIASES.get(normalized, normalized)
+    normalized = BASISPOINTS_MODEL_ALIASES.get(normalized, normalized)
     return normalized if normalized in EXCEL_MODEL_UPSTREAMS else None
 
 
@@ -219,6 +236,10 @@ def local_model_payload(model_id: str) -> dict[str, object]:
 def merge_local_model_capabilities(capabilities: dict[str, dict] | None) -> dict[str, dict]:
     merged = dict(capabilities or {})
     merged.update({key: dict(value) for key, value in LOCAL_MODEL_CAPABILITIES.items()})
+    merged.update({
+        base: dict(LOCAL_MODEL_CAPABILITIES[alias])
+        for base, alias in {**EXCEL_MODEL_ALIASES, **BASISPOINTS_MODEL_ALIASES}.items()
+    })
     return merged
 
 
@@ -226,9 +247,12 @@ def merge_local_models_payload(payload: dict | None) -> dict:
     result = dict(payload or {})
     raw_data = result.get("data")
     data = [dict(item) for item in raw_data if isinstance(item, dict)] if isinstance(raw_data, list) else []
-    data = [item for item in data if item.get("id") != "gpt-excel"]
-    existing_ids = {item.get("id") for item in data}
-    data.extend(local_model_payload(model_id) for model_id in MODEL_IDS if model_id not in existing_ids)
+    # Replace overlapping Copilot entries so discovery agrees with routing.
+    data = [
+        item for item in data
+        if item.get("id") != "gpt-excel" and item.get("id") not in PUBLIC_MODEL_IDS
+    ]
+    data.extend(local_model_payload(model_id) for model_id in PUBLIC_MODEL_IDS)
     result["object"] = result.get("object") or "list"
     result["data"] = data
     return result
@@ -258,18 +282,126 @@ def _iter_client_tools(tools: object, namespace: str | None = None):
                     tool,
                 )
         if tool_type == "namespace" and isinstance(name, str) and name.strip():
-            yield from _iter_client_tools(tool.get("tools"), name.strip())
+            yield from _iter_client_tools(
+                tool.get("tools"), _client_tool_key(name.strip(), namespace)
+            )
+
+
+def _client_tool_declarations(source: dict) -> list:
+    """Collect declarations from standard Responses and Responses Lite inputs.
+
+    Responses Lite puts namespaced declarations in additional_tools input
+    items rather than top-level tools. Read only declaration items, never
+    tool names embedded in message text or tool results.
+    """
+    top_level = source.get("tools")
+    tools = list(top_level) if isinstance(top_level, list) else []
+    raw_input = source.get("input")
+    for item in raw_input if isinstance(raw_input, list) else []:
+        if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            continue
+        declarations = item.get("tools")
+        if isinstance(declarations, list):
+            tools.extend(declarations)
+    return tools
+
+
+def _catalog_tool_types(source: dict) -> dict[str, str]:
+    return {key: kind for key, _name, _namespace, kind, _spec in _iter_client_tools(_client_tool_declarations(source))}
+
+
+def _tool_choice_mode(source: dict):
+    choice = source.get("tool_choice", "auto")
+    return choice.get("type", "auto") if isinstance(choice, dict) else choice
 
 
 def client_tool_types(source: dict) -> dict[str, str]:
-    if str(source.get("tool_choice") or "").strip().lower() == "none":
+    catalog = _catalog_tool_types(source)
+    mode = _tool_choice_mode(source)
+    if mode == "none":
         return {}
-    result: dict[str, str] = {}
-    for key, _name, _namespace, tool_type, _tool in _iter_client_tools(
-        source.get("tools")
-    ):
-        result[key] = tool_type
-    return result
+    if mode in ("function", "custom"):
+        choice = source["tool_choice"]
+        if not isinstance(choice, dict):
+            return {}
+        name = _client_tool_name_from_item(choice, catalog)
+        return {name: catalog[name]} if name is not None and catalog[name] == mode else {}
+    return catalog
+
+
+def validate_client_tool_choice(source: dict) -> None:
+    mode = _tool_choice_mode(source)
+    if mode in ("required", "function", "custom") and not client_tool_types(source):
+        raise ValueError("tool_choice requires a tool present in the current request catalog")
+
+
+def client_tool_selection_issue(response: dict, source: dict) -> str | None:
+    if response.get("status") in ("failed", "incomplete"):
+        return None
+    output = response.get("output")
+    if not isinstance(output, list):
+        return None
+    calls = [v for v in output if isinstance(v, dict) and v.get("type") in ("function_call", "custom_tool_call")]
+    expanded = _expanded_native_call_items(response)
+    if expanded is not None:
+        calls = expanded
+    if not calls and _tool_choice_mode(source) in ("required", "function", "custom"):
+        return "required_client_tool_missing"
+    if len(calls) > 1 and source.get("parallel_tool_calls") is False:
+        return "parallel_client_tools_not_allowed"
+    return None
+
+
+def client_tool_policy_instructions(source: dict) -> str:
+    mode = _tool_choice_mode(source)
+    if mode == "none":
+        return "The current request sets tool_choice=none. Do not call any tool. Respond with text only."
+    parts = []
+    if mode in ("required", "function", "custom"):
+        parts.append("The API tool_choice requires at least one valid client tool call in this response, even if the user message asks for text only. Do not answer with text instead of making that call.")
+    if mode in ("function", "custom"):
+        parts.append("The only permitted tool for this response is: " + ", ".join(sorted(client_tool_types(source))) + ".")
+    if source.get("parallel_tool_calls") is False:
+        parts.append("The API parallel_tool_calls=false permits at most one client tool call in this response.")
+    else:
+        parts.append('For TWO OR MORE independent requested calls, use ONE native run_officejs call with a VERSIONED BATCH object in code. Format example: {"type":"client_tool_batch","version":1,"calls":[{"name":"TOOL_A","arguments":{}},{"name":"TOOL_B","arguments":{}}]}. Replace TOOL_A and TOOL_B with real current catalog names and complete schema-valid arguments. This explicit batch object is the sole exception to the single-call layout. It is a proxy data format, NOT a tool named client_tool_batch. Each of 1 to 16 calls contains name and arguments or custom input; namespace is optional. No child IDs, nested transports, scripts, root arrays or invented tools. The entire batch is validated before dispatch, and child results return indexed by call_id. Do not split independent work across turns merely because BPS allows one native tool per turn. Batch calls must be final output items: no text or reasoning after them. Dependent calls that require earlier results must remain in later turns.')
+    return " ".join(parts)
+
+
+def client_tool_catalog_diagnostic(source: dict) -> dict:
+    """Describe the effective allowlist, never schemas or argument values."""
+    tools = _client_tool_declarations(source)
+    allowed = client_tool_types(source)
+    names = sorted(allowed)
+    encoded = json.dumps([(name, allowed[name]) for name in names],
+                         ensure_ascii=True, separators=(",", ":"))
+    # Bound log volume independently of the incoming tool catalog size.
+    visible = []
+    remaining = 16384
+    for name in names[:256]:
+        value = name[:256]
+        if len(value) > remaining:
+            break
+        visible.append(value)
+        remaining -= len(value)
+    kinds = {}
+    for item in tools if isinstance(tools, list) else []:
+        kind = item.get("type") if isinstance(item, dict) else None
+        kind = kind[:64] if isinstance(kind, str) else "<invalid>"
+        kinds[kind] = kinds.get(kind, 0) + 1
+    choice = source.get("tool_choice")
+    choice_kind = choice.get("type") if isinstance(choice, dict) else choice
+    if choice_kind not in (None, "none", "auto", "required", "function", "custom", "allowed_tools"):
+        choice_kind = "<other>"
+    return {
+        "root_tool_count": len(tools) if isinstance(tools, list) else 0,
+        "root_tool_types": kinds,
+        "callable_tool_count": len(names),
+        "callable_tools": visible,
+        "names_truncated": len(visible) != len(names) or any(len(name) > 256 for name in names),
+        "catalog_fingerprint": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        "tool_choice_kind": choice_kind,
+    }
 
 
 def relay_tool_name(name: str) -> str:
@@ -283,13 +415,28 @@ def _original_client_tool_name(
 ) -> str | None:
     if not isinstance(name, str):
         return None
-    if name.startswith(CLIENT_TOOL_RELAY_PREFIX):
-        candidate = name[len(CLIENT_TOOL_RELAY_PREFIX) :]
-        return candidate if candidate in allowed_tools else None
-    # Accept the old, unprefixed marker format for in-flight responses. Native
-    # Basispoints calls also arrive unprefixed; schema validation below decides
-    # whether one can safely stand in for a same-named client tool.
-    return name if name in allowed_tools else None
+    # Exact catalog keys always win, including a real functions namespace.
+    if name in allowed_tools:
+        return name
+    for prefix in (CLIENT_TOOL_RELAY_PREFIX, "functions."):
+        if name.startswith(prefix):
+            candidate = name[len(prefix):]
+            return candidate if candidate in allowed_tools else None
+    # Codex may omit its default functions namespace on returned calls.
+    # Never resolve an unqualified name against arbitrary MCP namespaces.
+    default_name = _client_tool_key(name, "functions")
+    if "." not in name and default_name in allowed_tools:
+        return default_name
+    return None
+
+
+def _client_tool_name_from_item(item: dict, allowed_tools: dict[str, str]) -> str | None:
+    name = item.get("name")
+    namespace = item.get("namespace")
+    if isinstance(namespace, str) and namespace and isinstance(name, str):
+        if not name.startswith(namespace + "."):
+            name = _client_tool_key(name, namespace)
+    return _original_client_tool_name(name, allowed_tools)
 
 
 def _remember_native_call(item: dict) -> None:
@@ -314,10 +461,18 @@ def _remembered_native_call(call_id: object) -> dict | None:
         return copy.deepcopy(item)
 
 
+def _client_tool_parameters(spec: dict) -> object:
+    # False is a valid JSON Schema, not an absent value.
+    for key in ("parameters", "inputSchema", "input_schema"):
+        if key in spec and spec[key] is not None:
+            return spec[key]
+    return None
+
+
 def _client_tool_specs(source: dict) -> dict[str, dict]:
     result: dict[str, dict] = {}
     for key, name, namespace, tool_type, tool in _iter_client_tools(
-        source.get("tools")
+        _client_tool_declarations(source)
     ):
         result[key] = {
             "key": key,
@@ -330,83 +485,7 @@ def _client_tool_specs(source: dict) -> dict[str, dict]:
 
 
 def _decode_transport_code(code: object) -> dict | None:
-    if isinstance(code, dict):
-        return code
-    if not isinstance(code, str):
-        return None
-
-    candidates = [code]
-    repaired = _repair_invalid_json_backslashes(code)
-    if repaired != code:
-        candidates.append(repaired)
-
-    # Models occasionally wrap the requested JSON in a code fence or a
-    # one-line assignment despite the exact-format instruction. Decode the
-    # first complete JSON object without ever evaluating the surrounding
-    # text as JavaScript. The repair pass only doubles backslashes that are
-    # invalid JSON escapes inside string values (for example ``\\(`` in a
-    # shell regex), preserving the command rather than executing anything.
-    decoder = json.JSONDecoder()
-    for candidate_text in candidates:
-        try:
-            envelope = json.loads(candidate_text)
-        except json.JSONDecodeError:
-            envelope = None
-            for index, character in enumerate(candidate_text):
-                if character != "{":
-                    continue
-                try:
-                    candidate, _ = decoder.raw_decode(candidate_text[index:])
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(candidate, dict):
-                    envelope = candidate
-                    break
-        if isinstance(envelope, dict):
-            return envelope
-    return None
-
-
-def _repair_invalid_json_backslashes(text: str) -> str:
-    """Double invalid backslashes inside JSON string values."""
-    repaired: list[str] = []
-    in_string = False
-    index = 0
-    while index < len(text):
-        character = text[index]
-        if not in_string:
-            repaired.append(character)
-            if character == '\"':
-                in_string = True
-            index += 1
-            continue
-        if character == '\"':
-            repaired.append(character)
-            in_string = False
-            index += 1
-            continue
-        if character != '\\':
-            repaired.append(character)
-            index += 1
-            continue
-
-        next_character = text[index + 1] if index + 1 < len(text) else ""
-        valid_escape = next_character in _JSON_ESCAPE_CHARS
-        if next_character == "u":
-            valid_escape = (
-                index + 5 < len(text)
-                and all(
-                    digit in "0123456789abcdefABCDEF"
-                    for digit in text[index + 2 : index + 6]
-                )
-            )
-        if valid_escape:
-            repaired.extend((character, next_character))
-            index += 2
-        else:
-            repaired.extend((character, character))
-            index += 1
-    return "".join(repaired)
+    return client_tool_transport.decode_transport_code(code)
 
 
 def _is_transport_name(name: object) -> bool:
@@ -414,92 +493,9 @@ def _is_transport_name(name: object) -> bool:
 
 
 def _transport_envelope(native: dict) -> dict | None:
-    if (
-        native.get("type") != "function_call"
-        or not _is_transport_name(native.get("name"))
-    ):
-        return None
-    raw_arguments = native.get("arguments")
-    if not isinstance(raw_arguments, str):
-        return None
-    try:
-        arguments = json.loads(raw_arguments)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(arguments, dict):
-        return None
-    envelope = _decode_transport_code(arguments.get("code"))
-    for _ in range(2):
-        if envelope is None or not _is_transport_name(envelope.get("name")):
-            break
-        nested_arguments = envelope.get("arguments")
-        if isinstance(nested_arguments, str):
-            try:
-                nested_arguments = json.loads(nested_arguments)
-            except json.JSONDecodeError:
-                return None
-        if not isinstance(nested_arguments, dict):
-            return None
-        envelope = _decode_transport_code(nested_arguments.get("code"))
-    if envelope is not None and _is_transport_name(envelope.get("name")):
-        return None
-    return envelope
-
-
-def _value_matches_schema(value: object, schema: object) -> bool:
-    if not isinstance(schema, dict) or not schema:
-        return True
-    expected_type = schema.get("type")
-    if isinstance(expected_type, list):
-        return any(
-            _value_matches_schema(value, {**schema, "type": candidate})
-            for candidate in expected_type
-        )
-    if expected_type == "object":
-        if not isinstance(value, dict):
-            return False
-        required = schema.get("required")
-        if isinstance(required, list) and any(
-            isinstance(key, str) and key not in value for key in required
-        ):
-            return False
-        properties = schema.get("properties")
-        if isinstance(properties, dict):
-            if schema.get("additionalProperties") is False and any(
-                key not in properties for key in value
-            ):
-                return False
-            for key, nested_value in value.items():
-                nested_schema = properties.get(key)
-                if nested_schema is not None and not _value_matches_schema(
-                    nested_value,
-                    nested_schema,
-                ):
-                    return False
-    elif expected_type == "array":
-        if not isinstance(value, list):
-            return False
-        item_schema = schema.get("items")
-        if item_schema is not None and any(
-            not _value_matches_schema(item, item_schema) for item in value
-        ):
-            return False
-    elif expected_type == "string" and not isinstance(value, str):
-        return False
-    elif expected_type == "integer" and (
-        not isinstance(value, int) or isinstance(value, bool)
-    ):
-        return False
-    elif expected_type == "number" and (
-        not isinstance(value, (int, float)) or isinstance(value, bool)
-    ):
-        return False
-    elif expected_type == "boolean" and not isinstance(value, bool):
-        return False
-    elif expected_type == "null" and value is not None:
-        return False
-    enum = schema.get("enum")
-    return not isinstance(enum, list) or value in enum
+    return client_tool_transport.decode_transport_envelope(
+        native, CLIENT_TOOL_TRANSPORT_ALIASES,
+    )
 
 
 _PLAN_STATUS_BY_ALIAS = {
@@ -599,6 +595,8 @@ def _restore_native_function_arguments(name: str, arguments: object) -> object:
 def extract_native_client_tool_call(
     response: dict | None,
     source: dict,
+    *,
+    remember: bool = True,
 ) -> dict[str, str] | None:
     if not isinstance(response, dict):
         return None
@@ -620,9 +618,9 @@ def extract_native_client_tool_call(
     if _is_transport_name(native.get("name")) and envelope is None:
         return None
     name = (
-        _original_client_tool_name(envelope.get("name"), allowed_tools)
+        _client_tool_name_from_item(envelope, allowed_tools)
         if envelope is not None
-        else _original_client_tool_name(native.get("name"), allowed_tools)
+        else _client_tool_name_from_item(native, allowed_tools)
     )
     if name is None or name not in specs:
         return None
@@ -651,11 +649,7 @@ def extract_native_client_tool_call(
             return None
         if envelope is None:
             arguments = _normalize_native_function_arguments(name, arguments)
-        input_schema = (
-            spec.get("parameters")
-            or spec.get("inputSchema")
-            or spec.get("input_schema")
-        )
+        input_schema = _client_tool_parameters(spec)
         if not _value_matches_schema(arguments, input_schema):
             return None
         native_call_id = native.get("call_id")
@@ -665,7 +659,8 @@ def extract_native_client_tool_call(
             else f"{NATIVE_FALLBACK_CALL_ID_PREFIX}{uuid4().hex}"
         )
         native_item_id = native.get("id")
-        _remember_native_call(native)
+        if remember:
+            _remember_native_call(native)
         result = {
             "type": "function_call",
             "id": (
@@ -701,8 +696,9 @@ def extract_native_client_tool_call(
             else f"{NATIVE_FALLBACK_CALL_ID_PREFIX}{uuid4().hex}"
         )
         native_item_id = native.get("id")
-        _remember_native_call(native)
-        return {
+        if remember:
+            _remember_native_call(native)
+        result = {
             "type": "custom_tool_call",
             "id": (
                 native_item_id
@@ -714,21 +710,28 @@ def extract_native_client_tool_call(
                 else f"ctc_{call_id}"
             ),
             "call_id": call_id,
-            "name": name,
+            "name": tool_info["name"],
             "input": custom_input,
         }
+        if tool_info["namespace"]:
+            result["namespace"] = tool_info["namespace"]
+        return result
     return None
 
 
 def _client_tool_protocol_instructions(source: dict) -> str:
     allowed_tools = client_tool_types(source)
     if not allowed_tools:
+        if _tool_choice_mode(source) == "none":
+            return EXTERNAL_CLIENT_INSTRUCTIONS + " " + client_tool_policy_instructions(source)
         return EXTERNAL_CLIENT_INSTRUCTIONS
 
     tool_catalog: list[dict[str, object]] = []
     for key, name, namespace, tool_type, tool in _iter_client_tools(
-        source.get("tools")
+        _client_tool_declarations(source)
     ):
+        if key not in allowed_tools:
+            continue
         entry: dict[str, object] = {
             "type": tool_type,
             "name": key,
@@ -740,12 +743,8 @@ def _client_tool_protocol_instructions(source: dict) -> str:
         if isinstance(description, str) and description:
             entry["description"] = description
         if tool_type == "function":
-            parameters = (
-                tool.get("parameters")
-                or tool.get("inputSchema")
-                or tool.get("input_schema")
-            )
-            entry["parameters"] = parameters if isinstance(parameters, dict) else {}
+            parameters = _client_tool_parameters(tool)
+            entry["parameters"] = parameters if isinstance(parameters, (dict, bool)) else {}
         else:
             custom_format = tool.get("format")
             if isinstance(custom_format, dict):
@@ -764,14 +763,19 @@ def _client_tool_protocol_instructions(source: dict) -> str:
         "transport endpoint owned by this proxy for this request. The proxy "
         "intercepts it before execution, so it never runs Office code or changes "
         "the workbook. Every client tool in the JSON catalog is available through "
-        "that transport. Other native server-injected Excel, Office, connector, "
+        "that transport. This request's catalog is the sole authority for tool "
+        "availability; tool names in conversation history, previous catalogs, "
+        "skills, or subagent messages do not make a tool available now. A tool "
+        "available in the parent chat may be absent in a subagent, and vice versa. "
+        "Never guess an unavailable tool or substitute a similarly named tool. "
+        "Other native server-injected Excel, Office, connector, "
         "workbook, list_skills, and web-search tools are unavailable. "
         "Never claim shell, filesystem, or workspace access is unavailable when the "
         "catalog contains a suitable tool. For repository inspection, invoke a "
         "suitable catalog shell tool (for example exec_command) through run_officejs. "
         "Transport has two layers and they must not be mixed: the outer native "
         "tool is run_officejs (some hosts display it as functions.run_officejs); "
-        "the inner code value is JSON text containing exactly one compact JSON object for one catalog "
+        "the inner code value is JSON text describing one single-call or explicit versioned-batch object for catalog "
         "client tool. The inner name is never run_officejs or functions.run_officejs. "
         "For a function tool, use this shape: outer arguments include summary, "
         "extended_summary, destructive=false, references=[], and code equal to "
@@ -792,9 +796,10 @@ def _client_tool_protocol_instructions(source: dict) -> str:
         "repeat a tool request whose output is already present. Available client "
         "tools:\n"
         + catalog_json
-        + "\nRemember: call the outer native run_officejs tool once; put exactly one "
-        "catalog-tool JSON object in its code field. A host prefix such as "
+        + "\nRemember: invoke outer run_officejs once for one call or one explicit batch; put exactly one "
+        "single-call or versioned-batch JSON object in its code field. A host prefix such as "
         "functions. is only display syntax, not an inner client-tool name."
+        + " " + client_tool_policy_instructions(source)
     )
 
 
@@ -818,7 +823,7 @@ def _client_tool_protocol_reminder(source: dict) -> str:
     reminder = (
         "Reminder: use the outer native run_officejs transport (a host may display "
         "it as functions.run_officejs); it never executes Office code here. Put "
-        "exactly one JSON object as JSON text in code, with name set to one catalog client tool "
+        "exactly one JSON object as JSON text in code. For a single call, set name to one catalog client tool "
         "below. Never set the inner name to run_officejs or functions.run_officejs, "
         "and never nest another transport envelope. The code field is not JavaScript; serialize "
         "the inner JSON and escape backslashes and quotes in shell commands. Example inner code: "
@@ -849,6 +854,7 @@ def _client_tool_protocol_reminder(source: dict) -> str:
             " Native update_plan is allowed for progress; after its result, "
             "take the next substantive action through run_officejs."
         )
+    reminder += " " + client_tool_policy_instructions(source)
     return reminder
 
 
@@ -910,9 +916,155 @@ def extract_client_tool_call(
     return None
 
 
-def response_payload_with_tool_call(
+def extract_validated_client_tool_call(text: str, source: dict) -> dict[str, str] | None:
+    """Keep legacy text markers compatible without bypassing schema validation."""
+    call = extract_client_tool_call(text, client_tool_types(source))
+    if call is None:
+        return None
+    envelope = {"name": call["name"]}
+    if call["type"] == "function_call":
+        envelope["arguments"] = json.loads(call["arguments"])
+    else:
+        envelope["input"] = call["input"]
+    native = {
+        "type": "function_call", "name": CLIENT_TOOL_TRANSPORT_NAME,
+        "id": call["id"], "call_id": call["call_id"],
+        "arguments": json.dumps({"code": json.dumps(envelope, ensure_ascii=False)}),
+    }
+    return extract_native_client_tool_call({"output": [native]}, source, remember=False)
+
+
+def _expanded_native_call_items(response):
+    output = response.get("output") if isinstance(response, dict) else None
+    if not isinstance(output, list):
+        return None
+    expanded = []
+    for position, item in enumerate(output):
+        if not isinstance(item, dict) or item.get("type") not in ("function_call", "custom_tool_call"):
+            continue
+        if client_tool_batch.is_batch_candidate(item):
+            children = client_tool_batch.expand_batch(item)
+            if children is None:
+                return None
+            if len(children) > 1 and any(
+                not isinstance(later, dict) or later.get("type") not in ("function_call", "custom_tool_call")
+                for later in output[position + 1:]
+            ):
+                return None
+            expanded.extend(children)
+        else:
+            expanded.append(item)
+        if len(expanded) > 64:
+            return None
+    return expanded
+
+
+def extract_native_client_tool_calls(response, source, *, remember=True):
+    """Validate all logical children atomically, then remember original parents."""
+    if not isinstance(response, dict) or not isinstance(response.get("output"), list):
+        return []
+    if client_tool_selection_issue(response, source):
+        return []
+    native_calls = _expanded_native_call_items(response)
+    if native_calls is None:
+        return []
+    calls = []
+    call_ids = set()
+    for item in native_calls:
+        translated = extract_native_client_tool_call({"output": [item]}, source, remember=False)
+        if translated is None or translated["call_id"] in call_ids:
+            return []
+        if client_tool_batch.parse_child_call_id(translated["call_id"]) is not None and len(translated["id"]) > 64:
+            prefix = "ctc_" if translated["type"] == "custom_tool_call" else "fc_"
+            translated["id"] = prefix + hashlib.sha256(translated["call_id"].encode()).hexdigest()[:48]
+        call_ids.add(translated["call_id"])
+        calls.append(translated)
+    if remember:
+        for item in response["output"]:
+            if isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call"):
+                _remember_native_call(item)
+    return calls
+
+
+def client_tool_rejection_diagnostics(response: dict, source: dict) -> list[dict[str, str]]:
+    """Report rejected names/reasons only; never log arguments or tool output."""
+    batch_items = [item for item in response.get("output", []) if client_tool_batch.is_batch_candidate(item)]
+    if batch_items:
+        expanded = _expanded_native_call_items(response)
+        if expanded is None:
+            reasons = [client_tool_batch.batch_error(item) for item in batch_items]
+            reason = next((value for value in reasons if value), "invalid_batch_layout_or_size")
+            return [{"tool": CLIENT_TOOL_TRANSPORT_NAME, "reason": "invalid_client_tool_batch", "batch_reason": reason}]
+        diagnostics = client_tool_rejection_diagnostics({**response, "output": expanded}, source)
+        if not diagnostics and not extract_native_client_tool_calls(response, source, remember=False):
+            diagnostics.append({"tool": CLIENT_TOOL_TRANSPORT_NAME, "reason": "invalid_client_tool_batch", "batch_reason": "duplicate_child_identity"})
+        return diagnostics
+    allowed = client_tool_types(source)
+    issue = client_tool_selection_issue(response, source)
+    diagnostics = [{"tool": "<tool_policy>", "reason": issue}] if issue else []
+    for item in response.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") not in {"function_call", "custom_tool_call"}:
+            continue
+        envelope = _transport_envelope(item)
+        target = envelope if envelope is not None else item
+        name = _client_tool_name_from_item(target, allowed)
+        if _is_transport_name(item.get("name")) and envelope is None:
+            reason = "malformed_transport"
+        elif not isinstance(target.get("name"), str) or not target["name"].strip():
+            reason = "missing_client_tool_name"
+        elif name is None:
+            reason = "unknown_client_tool"
+        elif extract_native_client_tool_call({"output": [item]}, source, remember=False) is None:
+            reason = "invalid_client_tool_arguments"
+        else:
+            continue
+        raw_name = target.get("name")
+        raw_name = raw_name if isinstance(raw_name, str) else "<missing>"
+        safe_name = ("<missing>" if raw_name == "<missing>" or not raw_name.strip() else
+                     "".join(c if c.isalnum() or c in "_.:-" else "?" for c in raw_name[:120]))
+        issue = {"tool": safe_name, "reason": reason}
+        if "namespace" in target:
+            namespace = target["namespace"]
+            issue["requested_namespace"] = (
+                "".join(c if c.isalnum() or c in "_.:-" else "?" for c in namespace[:120])
+                if isinstance(namespace, str) else "<invalid>"
+            )
+        if reason == "malformed_transport":
+            issue["transport_reason"] = client_tool_transport.diagnose_transport_envelope(
+                item, CLIENT_TOOL_TRANSPORT_ALIASES,
+            ) or "unclassified_transport_failure"
+        if reason == "malformed_transport":
+            issue["transport_detail"] = client_tool_transport.diagnose_transport_envelope_details(item, CLIENT_TOOL_TRANSPORT_ALIASES)
+        diagnostics.append(issue)
+    return diagnostics
+
+
+def client_tool_rejection_structure(response: dict) -> list[dict]:
+    """Bounded shape metadata only: no argument, prompt, or output values."""
+    records = []
+    for index, item in enumerate(response.get("output") or []):
+        if not isinstance(item, dict) or item.get("type") not in {"function_call", "custom_tool_call"}:
+            continue
+        envelope = _transport_envelope(item)
+        target = envelope if envelope is not None else item
+        records.append({
+            "output_index": index, "call_type": item["type"],
+            "name_present": "name" in item,
+            "name_type": type(item.get("name")).__name__,
+            "namespace_present": "namespace" in item,
+            "arguments_type": type(item.get("arguments")).__name__,
+            "envelope_decoded": envelope is not None,
+            "target_name_present": "name" in target,
+            "target_name_type": type(target.get("name")).__name__,
+        })
+        if len(records) >= 64:
+            break
+    return records
+
+
+def response_payload_with_tool_calls(
     response: dict | None,
-    tool_call: dict[str, str],
+    tool_calls: list[dict[str, str]],
     *,
     model_id: str = MODEL_ID,
 ) -> dict[str, object]:
@@ -922,25 +1074,31 @@ def response_payload_with_tool_call(
     result.setdefault("created_at", int(time.time()))
     result["status"] = "completed"
     result["model"] = model_id
-    completed_tool_call = {**tool_call, "status": "completed"}
-    existing_output = result.get("output")
-    replaced_native_call = False
-    output: list[dict] = []
-    if isinstance(existing_output, list):
-        for item in existing_output:
-            if (
-                not replaced_native_call
-                and isinstance(item, dict)
-                and item.get("type") in {"function_call", "custom_tool_call"}
-            ):
-                output.append(completed_tool_call)
-                replaced_native_call = True
-            elif isinstance(item, dict):
-                output.append(item)
-    result["output"] = output if replaced_native_call else [completed_tool_call]
+    completed = [{**call, "status": "completed"} for call in tool_calls]
+    pending = iter(completed)
+    output = []
+    replaced = False
+    for item in result.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {"function_call", "custom_tool_call"}:
+            output.append(next(pending, item))
+            replaced = True
+        else:
+            output.append(item)
+    result["output"] = output + list(pending) if replaced else completed
     result["error"] = None
     result["incomplete_details"] = None
     return result
+
+
+def response_payload_with_tool_call(
+    response: dict | None,
+    tool_call: dict[str, str],
+    *,
+    model_id: str = MODEL_ID,
+) -> dict[str, object]:
+    return response_payload_with_tool_calls(response, [tool_call], model_id=model_id)
 
 
 def _decode_jwt_exp(authorization: str) -> float | None:
@@ -1040,6 +1198,7 @@ class ExcelSessionStore:
     def __init__(self, persistence_file: str | None = None):
         self._lock = threading.Lock()
         self._headers: dict[str, str] = {}
+        self._source = "excel-cache"
         self._tools_version_id: str | None = None
         self._configured_at: float | None = None
         self._expires_at: float | None = None
@@ -1053,6 +1212,7 @@ class ExcelSessionStore:
         tools_version_id: object = None,
         persist: bool = True,
         allow_expired: bool = False,
+        source: str = "excel-cache",
     ) -> dict[str, object]:
         if not isinstance(raw_headers, dict):
             raise ValueError("headers must be a JSON object")
@@ -1098,6 +1258,7 @@ class ExcelSessionStore:
 
         with self._lock:
             self._headers = headers
+            self._source = source
             self._tools_version_id = normalized_tools_version_id
             self._configured_at = now
             self._expires_at = expires_at
@@ -1113,6 +1274,7 @@ class ExcelSessionStore:
     def clear(self) -> dict[str, object]:
         with self._lock:
             self._headers = {}
+            self._source = "excel-cache"
             self._tools_version_id = None
             self._configured_at = None
             self._expires_at = None
@@ -1183,6 +1345,7 @@ class ExcelSessionStore:
 
     def status(self) -> dict[str, object]:
         with self._lock:
+            source = self._source
             configured = bool(self._headers)
             tools_version_id = self._tools_version_id
             configured_at = self._configured_at
@@ -1191,6 +1354,7 @@ class ExcelSessionStore:
         expired = expires_at is not None and expires_at <= time.time()
         return {
             "configured": configured,
+            "source": source,
             "expired": expired,
             "configured_at": configured_at,
             "expires_at": expires_at,
@@ -1315,7 +1479,7 @@ def _normalized_tool_output(
 
 def _fallback_transport_call(item: dict) -> dict:
     """Rebuild a transport call if the proxy restarted between call and result."""
-    name = str(item.get("name") or "")
+    name = _client_tool_key(str(item.get("name") or ""), item.get("namespace"))
     if item.get("type") == "custom_tool_call":
         envelope: dict[str, object] = {
             "name": name,
@@ -1374,6 +1538,23 @@ def _strip_client_only_item_metadata(item: dict) -> dict:
     return sanitized
 
 
+TOOL_REJECTION_TEXT_PREFIX = "[tool_conversion_rejected]"
+
+
+def _is_proxy_tool_rejection_message(item: dict) -> bool:
+    if item.get("role") != "assistant":
+        return False
+    if str(item.get("id") or "").startswith("msg_proxy_tool_rejection_"):
+        return True
+    content = item.get("content")
+    if isinstance(content, str):
+        return content.startswith(TOOL_REJECTION_TEXT_PREFIX)
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and isinstance(part.get("text"), str)
+        and part["text"].startswith(TOOL_REJECTION_TEXT_PREFIX) for part in content
+    )
+
+
 def translate_input_items(
     raw_input: object,
     allowed_tools: dict[str, str] | None = None,
@@ -1401,13 +1582,28 @@ def translate_input_items(
     if not isinstance(raw_input, list):
         return []
 
+    raw_input = client_tool_batch.collapse_history(raw_input, _remembered_native_call)
     call_origins: dict[str, str] = {}
     result: list = []
+    reasoning_scope_start = 0
     for item in raw_input:
         if not isinstance(item, dict):
             continue
         item = _strip_client_only_item_metadata(item)
         item_type = str(item.get("type") or "").strip().lower()
+        if item_type == "additional_tools":
+            # Already included in the client catalog. The upstream uses the
+            # run_officejs transport, not a second native client tool surface.
+            continue
+        if item.get("role") in {"user", "system", "developer"}:
+            reasoning_scope_start = len(result)
+        if _is_proxy_tool_rejection_message(item):
+            # The proxy replaced this generation's undispatched calls with a
+            # warning. Do not replay opaque reasoning referencing absent calls.
+            result[reasoning_scope_start:] = [
+                previous for previous in result[reasoning_scope_start:]
+                if not isinstance(previous, dict) or previous.get("type") != "reasoning"
+            ]
         if item_type in {"function_call", "custom_tool_call"}:
             name = item.get("name")
             call_id = item.get("call_id")
@@ -1415,6 +1611,12 @@ def translate_input_items(
                 isinstance(call_id, str)
                 and call_id.startswith(CLIENT_MARKER_CALL_ID_PREFIX)
             )
+            if client_tool_batch.is_batch_candidate(item):
+                if client_tool_batch.batch_error(item) is not None:
+                    raise ValueError("invalid_batch_history_parent")
+                call_origins[call_id] = CLIENT_TOOL_TRANSPORT_NAME
+                result.append(item)
+                continue
             remembered = _remembered_native_call(call_id)
             if remembered is not None:
                 native_name = remembered.get("name")
@@ -1422,12 +1624,12 @@ def translate_input_items(
                     call_origins[call_id] = native_name
                 result.append(remembered)
             elif isinstance(name, str) and name and marker_relay:
-                upstream_name = relay_tool_name(name)
+                upstream_name = relay_tool_name(_client_tool_key(name, item.get("namespace")))
                 if isinstance(call_id, str):
                     call_origins[call_id] = upstream_name
                 result.append({**item, "name": upstream_name})
             elif isinstance(name, str) and name:
-                if name == "update_plan":
+                if name == "update_plan" and not item.get("namespace"):
                     if isinstance(call_id, str):
                         call_origins[call_id] = name
                     result.append(
@@ -1449,6 +1651,7 @@ def translate_input_items(
             continue
         if item_type in {"function_call_output", "custom_tool_call_output"}:
             result.append(_normalized_tool_output(item, call_origins))
+            reasoning_scope_start = len(result)
             continue
         if item_type == "reasoning":
             encrypted = item.get("encrypted_content")
@@ -1573,7 +1776,16 @@ def prepare_responses_body(
     }
 
     raw_input = source.get("input")
-    input_items = translate_input_items(raw_input, client_tool_types(source))
+    if isinstance(raw_input, list):
+        from format_translation import decode_fake_compaction, _summary_message_item
+        for index in range(len(raw_input) - 1, -1, -1):
+            item = raw_input[index]
+            if isinstance(item, dict) and item.get("type") == "compaction":
+                summary = decode_fake_compaction(item.get("encrypted_content"))
+                if summary is not None:
+                    raw_input = [_summary_message_item(summary)] + raw_input[index + 1:]
+                break
+    input_items = translate_input_items(raw_input, _catalog_tool_types(source))
     # Captured before the prologue is prepended: the injected instructions and
     # catalog are identical across conversations, so only the caller's own
     # first history item identifies this conversation. Use translated items:
@@ -1633,8 +1845,16 @@ def prepare_responses_body(
 
     metadata: dict[str, str] = {}
     raw_metadata = source.get("metadata")
+    # Opt-in diagnostic control: do not advertise or enable unverified BPS
+    # parallel support for ordinary clients. Never pass this local marker on.
+    if (isinstance(raw_metadata, dict)
+            and raw_metadata.get("ghcp_native_parallel_probe") is True
+            and type(source.get("parallel_tool_calls")) is bool):
+        output["parallel_tool_calls"] = source["parallel_tool_calls"]
     if isinstance(raw_metadata, dict):
         for key, value in raw_metadata.items():
+            if key == "ghcp_native_parallel_probe":
+                continue
             if isinstance(key, str) and isinstance(value, (str, int, float, bool)):
                 metadata[key[:64]] = str(value)[:512]
     turn_fingerprint, iteration = _agent_turn_state(raw_input)

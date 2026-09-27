@@ -983,10 +983,19 @@ def _chat_content_item_to_response_content(item: dict, *, role: str = "user") ->
                 annotations = item.get("response_annotations")
             content_item["annotations"] = annotations if isinstance(annotations, list) else []
         return content_item
-    if item_type == "image_url":
-        image_url = item.get("image_url")
-        if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
-            return {"type": "input_image", "image_url": image_url["url"]}
+    if item_type == 'image_url':
+        image_url = item.get('image_url')
+        detail = item.get('detail')
+        if isinstance(image_url, dict):
+            if detail is None:
+                detail = image_url.get('detail')
+            image_url = image_url.get('url')
+        if not isinstance(image_url, str) or not image_url.strip():
+            raise ValueError('Chat image_url blocks must include a non-empty URL')
+        content_item = {'type': 'input_image', 'image_url': image_url}
+        if detail is not None:
+            content_item['detail'] = detail
+        return content_item
     return None
 
 

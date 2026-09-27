@@ -14,10 +14,12 @@ from typing import Callable, Mapping
 
 from fastapi import HTTPException
 
+import excel_upstream
+
 from constants import CODEX_PROXY_BASE_URL, DASHBOARD_BASE_URL, MODEL_PRICING
 
-LEGACY_CODEX_PROXY_BASE_URL = "http://localhost:8000/v1"
-LEGACY_DASHBOARD_BASE_URL = "http://localhost:8000"
+LEGACY_CODEX_PROXY_BASE_URL = CODEX_PROXY_BASE_URL.replace("127.0.0.1", "localhost")
+LEGACY_DASHBOARD_BASE_URL = DASHBOARD_BASE_URL.replace("127.0.0.1", "localhost")
 
 
 _DEFAULT_CODEX_BASE_INSTRUCTIONS = (
@@ -48,12 +50,7 @@ def _format_token_rate(value: object) -> str:
 
 
 def _model_token_pricing_description(model_name: str) -> str:
-    if model_name.endswith("-excel") and model_name in {
-        "gpt-6-astra-excel",
-        "gpt-5.6-luna-excel",
-        "gpt-5.6-terra-excel",
-        "gpt-5.6-sol-excel",
-    }:
+    if excel_upstream.is_excel_model(model_name):
         return "ChatGPT subscription usage; not API-token billing"
     pricing = MODEL_PRICING.get(model_name)
     if not isinstance(pricing, Mapping):
@@ -969,8 +966,9 @@ class ProxyClientConfigService:
             family = self._model_family(routed_model_name)
             caps = capabilities.get(routed_model_name) if isinstance(capabilities, Mapping) else None
             caps = caps if isinstance(caps, Mapping) else {}
+            pricing_model_name = excel_upstream.excel_model_id(routed_model_name) or routed_model_name
             provider = str(
-                MODEL_PRICING.get(routed_model_name, {}).get("provider")
+                MODEL_PRICING.get(pricing_model_name, {}).get("provider")
                 or caps.get("provider")
                 or "Unknown"
             )
@@ -1136,13 +1134,19 @@ class ProxyClientConfigService:
     ) -> tuple[list[dict[str, str]], str | None]:
         normalized_model_name = self._normalize_model_name(model_name)
         is_gpt_56 = normalized_model_name.startswith(_GPT_56_MODEL_PREFIX)
-        is_excel_model = normalized_model_name.endswith("-excel")
+        excel_model_id = excel_upstream.excel_model_id(normalized_model_name)
+        is_excel_model = excel_model_id is not None
+        excel_efforts = excel_upstream.EXCEL_MODEL_REASONING_EFFORTS.get(
+            excel_model_id, excel_upstream.EXCEL_REASONING_EFFORTS
+        )
         supports_max = (is_gpt_56 and not is_excel_model) or family == "claude"
         efforts: list[str] = []
         if isinstance(raw_efforts, (list, tuple)):
             for item in raw_efforts:
                 if isinstance(item, str) and item:
                     normalized = item.strip().lower()
+                    if is_excel_model and normalized not in excel_efforts:
+                        continue
                     if normalized == "max" and not supports_max:
                         # Keep capability payloads for models without a
                         # supported max level from exposing it.
@@ -1160,7 +1164,9 @@ class ProxyClientConfigService:
         if not efforts:
             if family == "gpt":
                 efforts = list(
-                    _GPT_56_REASONING_EFFORTS
+                    excel_efforts
+                    if is_excel_model
+                    else _GPT_56_REASONING_EFFORTS
                     if is_gpt_56 and not is_excel_model
                     else _DEFAULT_REASONING_EFFORTS
                 )
@@ -1191,6 +1197,11 @@ class ProxyClientConfigService:
     ) -> list[str]:
         family_order = {"gpt": 0, "claude": 1, "gemini": 2, "grok": 3}
         preferred_order = {
+            "gpt-6-astra": -33,
+            "gpt-6-sol": -32,
+            "gpt-6-luna": -31,
+            "gpt-6-sol-excel": -29,
+            "gpt-6-luna-excel": -28,
             "gpt-6-astra-excel": -27,
             "gpt-5.6-sol-excel": -26,
             "gpt-5.6-terra-excel": -25,

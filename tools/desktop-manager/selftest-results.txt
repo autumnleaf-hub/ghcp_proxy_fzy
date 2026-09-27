@@ -1,0 +1,95 @@
+﻿PASS  Python flags adopted with verified identity: -X utf8 absolute
+PASS  Python flags adopted with verified identity: -X utf8 relative
+PASS  Flagged absolute legacy launch still requires confirmation: -X utf8
+PASS  Python flags adopted with verified identity: -W ignore absolute
+PASS  Python flags adopted with verified identity: -W ignore relative
+PASS  Flagged absolute legacy launch still requires confirmation: -W ignore
+PASS  Python flags adopted with verified identity: -Xutf8 absolute
+PASS  Python flags adopted with verified identity: -Xutf8 relative
+PASS  Flagged absolute legacy launch still requires confirmation: -Xutf8
+PASS  Python flags adopted with verified identity: -Wignore absolute
+PASS  Python flags adopted with verified identity: -Wignore relative
+PASS  Flagged absolute legacy launch still requires confirmation: -Wignore
+PASS  Python flags adopted with verified identity: -u -B -E -s -S -I -O -OO -X dev -Werror absolute
+PASS  Python flags adopted with verified identity: -u -B -E -s -S -I -O -OO -X dev -Werror relative
+PASS  Flagged absolute legacy launch still requires confirmation: -u -B -E -s -S -I -O -OO -X dev -Werror
+PASS  Malformed or unrelated command refused: -X
+PASS  Malformed or unrelated command refused: -W
+PASS  Malformed or unrelated command refused: -X utf8
+PASS  Malformed or unrelated command refused: -W ignore
+PASS  Malformed or unrelated command refused: -X C:\Fixture Repo\Proxy\proxy.py
+PASS  Malformed or unrelated command refused: -W C:\Fixture Repo\Proxy\proxy.py
+PASS  Malformed or unrelated command refused: -c proxy.py
+PASS  Malformed or unrelated command refused: -Xutf8 other.py proxy.py
+PASS  Malformed or unrelated command refused: -m
+PASS  Malformed or unrelated command refused: -m uvicorn
+PASS  Malformed or unrelated command refused: -m other proxy:app
+PASS  Malformed or unrelated command refused: -m uvicorn other:app
+PASS  uvicorn module with flags is adopted only with verified identity
+PASS  uvicorn refuses unverified identity: missing
+PASS  uvicorn refuses unverified identity: timeout
+PASS  uvicorn refuses unverified identity: root
+PASS  uvicorn refuses unverified identity: pid
+PASS  uvicorn refuses unverified identity: port
+PASS  uvicorn refuses unverified identity: instance
+PASS  uvicorn refuses unverified identity: owner
+PASS  Stop capability policy: omitted
+PASS  Stop capability policy: True
+PASS  Stop capability policy: False
+PASS  Verified uvicorn unsupported graceful stop needs force confirmation
+PASS  Confirmed force stop revalidates and refuses changed instance
+PASS  Confirmed force stop revalidates and refuses changed capability
+PASS  Confirmed force stop revalidates and refuses changed missing
+PASS  Confirmed force stop revalidates and refuses changed timeout
+PASS  Confirmed force stop revalidates and refuses changed root
+PASS  Confirmed force stop revalidates and refuses changed owner
+PASS  Confirmed force stop revalidates and refuses changed creation
+PASS  Confirmed force stop revalidates and refuses changed command
+PASS  Confirmed force stop revalidates and refuses changed listener
+PASS  Graceful capability changing to false refuses stale confirmed stop
+PASS  External same-project absolute launch is adopted (no start)
+PASS  External relative launch is adopted with new identity
+PASS  Stopped service launches once through adapter
+PASS  Port conflict: non-GHCP identity refuses start and stop
+PASS  Different project root is refused
+PASS  Prefix-similar project path is not equal
+PASS  Case and trailing separator normalize consistently
+PASS  Listener PID must match server identity
+PASS  Identity port must match configured port
+PASS  Process owner SID must be current user
+PASS  GetOwner name must match current user
+PASS  Non-Python executable is refused
+PASS  Another Python script with proxy.py argument is refused
+PASS  Python -c cannot masquerade as script path
+PASS  Identity startup delta greater than 30s is refused
+PASS  Identity preceding process creation is refused
+PASS  Empty instance is refused
+PASS  Multiple bound owners are refused
+PASS  Duplicate IPv4/IPv6 rows for same PID are accepted
+PASS  Listener change during HTTP verification is refused
+PASS  Graceful stop exact identity uses no force kill
+PASS  Stale instance refuses stop
+PASS  Reused PID with new creation time refuses stop
+PASS  Legacy absolute-path process requires explicit confirmation
+PASS  Legacy relative-path process refuses stop and explains upgrade
+PASS  HTTP failure never enables legacy kill fallback
+PASS  Legacy PID reuse is refused immediately before adapter kill
+PASS  Port bounds include 1 and 65535; reject 0/65536
+PASS  Settings default without write, atomic roundtrip and backup
+PASS  Malformed settings preserved until deliberate edit
+PASS  Autostart quotes executable/root and escapes trailing slash
+PASS  Command quoting round-trips embedded quotes and slashes
+PASS  Registry adapter read-only initialization and project isolation
+PASS  Autostart refuses deletion of externally changed entry
+PASS  Launch environment changes only GHCP_PORT in child copy
+PASS  WMI current process owner and creation timestamp
+PASS  Ephemeral fixture: native bound PID, HTTP identity and guarded stop shape
+PASS  Hidden child survives launcher exit and retains stdout/stderr logs
+PASS  Preview CLI renders real content and rejects a uniform blank bitmap
+PASS  X cancels close, preserves form/tray lifetime, and performs no service action
+PASS  Exit dialog defaults to leave running and cancel is non-destructive
+PASS  Project singleton event activates owner without service actions
+
+91 checks recorded; passed: 91; failures: 0
+Safety: synthetic controllers/registry; real HTTP only ephemeral loopback !=8000/8001; fixture child is this EXE, never proxy.py.
+No user manager settings, Run registry values, or actual proxy service were modified.
